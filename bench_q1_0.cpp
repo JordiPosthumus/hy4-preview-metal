@@ -9,6 +9,7 @@
 #include <cmath>
 #include <vector>
 #include <random>
+#include <cstdlib>
 #include <chrono>
 
 int main() {
@@ -33,14 +34,15 @@ int main() {
     struct ggml_init_params ip = { 512 * 1024 * 1024, NULL, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * A = ggml_new_tensor_2d(ctx, GGML_TYPE_Q1_0, n_per_row, n_rows);
-    ggml_tensor * X = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_per_row, 1);
+    const int BS = getenv("BS") ? atoi(getenv("BS")) : 1;
+    ggml_tensor * X = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_per_row, BS);
     ggml_tensor * C = ggml_mul_mat(ctx, A, X);
     ggml_cgraph * g = ggml_new_graph(ctx);
     ggml_build_forward_expand(g, C);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
 
     ggml_backend_tensor_set(A, wq.data(), 0, ggml_nbytes(A));
-    std::vector<float> x(n_per_row, 0.01f);
+    std::vector<float> x((size_t)n_per_row*BS, 0.01f);
     ggml_backend_tensor_set(X, x.data(), 0, ggml_nbytes(X));
 
     // warmup
@@ -52,8 +54,8 @@ int main() {
     double sec = std::chrono::duration<double>(t1 - t0).count();
 
     double bytes = (double)ggml_nbytes(A) * iters;
-    printf("matvec %dx%d STQ1_0: %.2f ms/iter, effective BW = %.0f GB/s\n",
-           n_rows, n_per_row, sec / iters * 1e3, bytes / sec / 1e9);
+    printf("BS=%d matvec %dx%d STQ1_0: %.2f ms/iter, effective BW = %.0f GB/s\n",
+           BS, n_rows, n_per_row, sec / iters * 1e3, bytes / sec / 1e9);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
