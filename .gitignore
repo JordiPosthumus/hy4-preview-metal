@@ -1,0 +1,7 @@
+weights/
+*.bin
+build-*/
+*.log
+*.pid
+__pycache__/
+.DS_Store
