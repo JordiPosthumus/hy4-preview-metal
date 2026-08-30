@@ -1,0 +1,31 @@
+[ckpt] device
+[ckpt] read shader
+[ckpt] compile shader (runtime)
+[ckpt] compiled
+[ckpt] cpu reference
+[ckpt] cpu reference done
+[variant] kernel_mv_v0_8x2
+  max_rel_err=1.28e-04     0.94 ms/iter   BW=  47 GB/s
+[variant] kernel_mv_v2_4x4
+  max_rel_err=5.48e-04     0.68 ms/iter   BW=  64 GB/s
+[variant] kernel_mv_v3_4x4
+  max_rel_err=3.19e-04     0.69 ms/iter   BW=  64 GB/s
+[variant] kernel_mv_v4_4x2
+  max_rel_err=1.27e+03     0.73 ms/iter   BW=  61 GB/s
+[variant] kernel_mv_v4_8x2
+  max_rel_err=1.27e+03     0.81 ms/iter   BW=  54 GB/s
+[variant] kernel_mv_v4_4x4
+  max_rel_err=1.27e+03     0.75 ms/iter   BW=  59 GB/s
+[variant] kernel_mv_v4_8x4
+  max_rel_err=1.27e+03     0.86 ms/iter   BW=  51 GB/s
+[variant] kernel_mv_v4_2x8
+  max_rel_err=1.27e+03     0.65 ms/iter   BW=  68 GB/s
+[variant] kernel_mv_v4_4x8
+  max_rel_err=1.27e+03     0.66 ms/iter   BW=  67 GB/s
+[variant] kernel_mv_v2_4x8
+  max_rel_err=5.48e-04     0.66 ms/iter   BW=  66 GB/s
+[variant] kernel_mv_v2_8x4
+  max_rel_err=5.48e-04     0.70 ms/iter   BW=  63 GB/s
+[variant] kernel_mv_v2_2x8
+  max_rel_err=5.48e-04     0.64 ms/iter   BW=  69 GB/s
+[ckpt] done

@@ -84,8 +84,10 @@ int main(int argc, char ** argv) {
         std::vector<unsigned char> w((size_t)ne01 * row_bytes);
         for (auto & v : w) v = (unsigned char)byte(rng);
         for (int r = 0; r < ne01; ++r) {
-            _Float16 * d = (_Float16 *)(w.data() + (size_t)r*row_bytes + 40);
-            *d = (_Float16)fdist(rng);
+            for (int b = 0; b < blocks_per_row; ++b) {
+                _Float16 * d = (_Float16 *)(w.data() + (size_t)r*row_bytes + (size_t)b*42 + 40);
+                *d = (_Float16)(0.25f + 0.5f*fdist(rng));   // finite, non-zero scales everywhere
+            }
         }
         std::vector<float> y(ne00);
         for (auto & v : y) v = fdist(rng);
@@ -121,14 +123,16 @@ int main(int argc, char ** argv) {
         args.ne00 = ne00; args.ne01 = ne01; args.nb01 = row_bytes; args.nb11 = (uint64_t)ne00*4; args.ne0 = ne01;
         memcpy(abuf.contents, &args, sizeof(args));
 
-        const char * variants[] = { "kernel_mv_v0_8x2", "kernel_mv_v2_8x2", "kernel_mv_v3_8x2",
-                                    "kernel_mv_v2_4x4", "kernel_mv_v3_4x4", "kernel_mv_v2_16x1", "kernel_mv_v3_16x1" };
-        const int nsgs[] = { 2, 2, 2, 4, 4, 1, 1 };
-        const int nr0s[] = { 8, 8, 8, 4, 4, 16, 16 };
+        const char * variants[] = { "kernel_mv_v0_8x2", "kernel_mv_v2_4x4", "kernel_mv_v3_4x4",
+                                    "kernel_mv_v4_4x2", "kernel_mv_v4_8x2", "kernel_mv_v4_4x4", "kernel_mv_v4_8x4",
+                                    "kernel_mv_v4_2x8", "kernel_mv_v4_4x8",
+                                    "kernel_mv_v2_4x8", "kernel_mv_v2_8x4", "kernel_mv_v2_2x8", "kernel_mv_v4b_2x8" };
+        const int nsgs[] = { 2, 4, 4, 2, 2, 4, 4, 8, 8, 8, 4, 8, 8 };
+        const int nr0s[] = { 8, 4, 4, 4, 8, 4, 8, 2, 4, 4, 8, 2, 2 };
 
         id<MTLCommandQueue> q = [dev newCommandQueue];
 
-        for (int v = 0; v < 7; ++v) {
+        for (int v = 0; v < 13; ++v) {
             printf("[variant] %s\n", variants[v]); fflush(stdout);
             id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:variants[v]]];
             if (!fn) { printf("  MISSING\n"); continue; }
@@ -147,6 +151,10 @@ int main(int argc, char ** argv) {
 
             // correctness
             float * out = (float *)dbuf.contents;
+            if (getenv("DBG") && v >= 3) {
+                printf("  dbg out[0..3]: %.4f %.4f %.4f %.4f\n", out[0], out[1], out[2], out[3]);
+                printf("  dbg ref[0..3]: %.4f %.4f %.4f %.4f\n", ref[0], ref[1], ref[2], ref[3]);
+            }
             double max_rel = 0;
             for (int r = 0; r < ne01; ++r) {
                 double e = fabs(out[r] - ref[r]) / (fabs(ref[r]) + 1e-9);

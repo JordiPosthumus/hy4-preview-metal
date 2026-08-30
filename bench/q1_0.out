@@ -1,0 +1,28 @@
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 8.452 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M3 Ultra)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 522267.39 MB
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M3 Ultra
+ggml_metal_init: picking default device: Apple M3 Ultra
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_q1_0_f32', name = 'kernel_mul_mv_q1_0_f32_nsg=2_ne12=1_r2=1_r3=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_q1_0_f32_nsg=2_ne12=1_r2=1_r3=1      0x100bf48a0 | th_max = 1024 | th_width =   32
+ggml_metal_free: deallocating
+quantizing 16384 x 16384 ...
+quantized size: 37.7 MB (0.141 bytes/weight)
+matvec 16384x16384 STQ1_0: 0.32 ms/iter, effective BW = 119 GB/s
