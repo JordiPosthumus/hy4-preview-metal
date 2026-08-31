@@ -127,3 +127,12 @@ build-metal/bin/llama-server -m Hy4-preview-STQ1_0.gguf -a Hy4-preview-STQ1_0 \
 
 Everything else in this repo (the Metal kernels, harness, scripts) by
 [JordiPosthumus](https://github.com/JordiPosthumus), MIT.
+
+**On authorship of the kernels.** The Metal kernels, the standalone benchmark harness and the
+correctness test in this repo were written by **GLM-5.3-Flash** (open weights, Zhipu/Z.ai),
+quantised to Q4 and served locally by the owner's [DS4](https://github.com/antirez/ds4)
+inference server, working under human direction: the measurements, the acceptance criteria
+("nothing ships unvalidated"), and the decision to reject the arithmetic-decode variant were
+the human's; the code was the model's. Documented because if a local open-weights model can
+port a quantisation format to Metal, that fact is more useful to you than any individual
+kernel here — and because the model deserves the credit.
