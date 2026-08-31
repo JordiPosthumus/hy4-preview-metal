@@ -30,6 +30,9 @@ Plus the host-side pipeline plumbing (`ggml-metal-device.cpp`, `ggml-metal-ops.c
 
 ## Results (M3 Ultra)
 
+> Kernel bandwidth below is measured on this machine. End-to-end token throughput is a marked
+> estimate, not a measurement.
+
 Decode-path matvec bandwidth (16384×16384, standalone A/B bench):
 
 | kernel | bandwidth |
@@ -40,7 +43,10 @@ Decode-path matvec bandwidth (16384×16384, standalone A/B bench):
 | llama.cpp's own q1_0 ternary kernel (family ceiling reference) | 119 GB/s |
 | Q8_0 (mature integer kernel) | 396 GB/s |
 
-Prefill (`mul_mm`, BS=32): 22 GB/s vs q1_0's 24 GB/s — pattern parity.
+Prefill: the shipped path uses llama.cpp's generic `mul_mm` template instantiated with the
+STQ1_0 dequant. A dedicated prefill kernel measured in the standalone harness reached
+22 GB/s vs q1_0's 24 GB/s (BS=32) — i.e. the ternary pattern has no structural prefill
+penalty. End-to-end pp/tg numbers are still being measured (see Results).
 
 Correctness: all three batch paths match a float64 reference to float rounding
 (max abs err 0.0000–0.023 on unit-scale dots; the CPU int8 path is less accurate
