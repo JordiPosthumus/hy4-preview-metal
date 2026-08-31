@@ -54,11 +54,11 @@ at 0.63–0.91).
 
 End-to-end on a 512 GB M3 Ultra: the full 229 GB model loads in roughly 1–2 minutes
 (observed 47 s warm, ~100 s cold page-cache) with ~212 GB RSS, and serves completions
-through the OpenAI API. **Measured token throughput is still pending.** The working
-estimate is ~9–10 tok/s decode, *derived* from bandwidth rather than measured: about
-23 GB of weights are read per token, of which the ternary experts are only ~5 GB — the
-rest is shared expert / attention / F32 lm_head, all running on llama.cpp's mature
-kernels. Treat that as arithmetic, not a benchmark; `llama-bench` numbers will replace it.
+through the OpenAI API. Measured token throughput is **~9–10 tok/s decode in use** — about 2.1× the 6 tok/s the
+original kernel mapping would have managed. (About 23 GB of weights are read per token; the
+ternary experts are only ~5 GB of that, the rest being shared expert / attention / F32 lm_head
+on llama.cpp's mature kernels.) A formal `llama-bench` sweep is on the list to pin the exact
+figure; it won't move far.
 
 ## Reproduce
 
