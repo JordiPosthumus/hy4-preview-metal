@@ -32,7 +32,7 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
 - Q8_0 (mature int kernel):              396 GB/s
 - Gotcha found: 42B block stride => uint loads misaligned on odd blocks (42%2=2 mod 4);
   must use 2-byte-aligned ushort loads. This was the v4 "wrong results" bug.
-- Benchmarks are noisy ±20%: other resident GPU models share the GPU.
+- Benchmarks are noisy ±20%: other the resident model servers models share the GPU.
 
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).

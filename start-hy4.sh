@@ -5,7 +5,7 @@
 set -euo pipefail
 
 readonly SCRIPT_NAME=${0:t}
-readonly RUNTIME_DIR=$HOME/Hy4
+readonly RUNTIME_DIR="${HOME}/Hy4"
 readonly BIN="$RUNTIME_DIR/llama.cpp/build-metal/bin/llama-server"
 readonly MODEL="$RUNTIME_DIR/weights/Hy4-preview-STQ1_0.gguf"
 readonly ALIAS="Hy4-preview-STQ1_0"
@@ -47,7 +47,7 @@ check_memory() {
       print -u2 -- "  $(gb_human $kb)  $cmd"
     done
     print -u2 -- ""
-    print -u2 -- "Stop or switch away the other resident GPU models first (your other models' stop scripts), then retry."
+    print -u2 -- "Stop or switch away any other resident GPU models first, then retry."
     print -u2 -- "Refusing to start: last attempt died from an apparent memory-pressure SIGKILL."
     exit 1
   fi

@@ -1,4 +1,4 @@
-From c933feb721a7ef166d77e888994651c3f3a88b52 Mon Sep 17 00:00:00 2001
+From bb6e8d30610716ca79a72e83196fb481c42b7f00 Mon Sep 17 00:00:00 2001
 From: JordiPosthumus <jordiposthumus@users.noreply.github.com>
 Date: Sun, 30 Aug 2026 14:38:50 -0300
 Subject: [PATCH] STQ1_0 mul_mv: group-aligned mapping, 45 -> 94 GB/s (2.08x)

@@ -3,11 +3,11 @@
 # Model is NOT loaded by this script's helpers below; each command is run manually.
 set -euo pipefail
 
-RUNTIME=~/Hy4/llama.cpp/build-metal/bin
-MODEL=~/Hy4/weights/Hy4-preview-STQ1_0.gguf
+RUNTIME=${HOME}/Hy4/llama.cpp/build-metal/bin
+MODEL=${HOME}/Hy4/weights/Hy4-preview-STQ1_0.gguf
 
 echo "== 0. Preconditions"
-echo "   - Stop/switch away the other resident GPU models first (your other models' stop scripts)."
+echo "   - Stop/switch away any other resident GPU models first."
 echo "   - Free memory target: ~240GB wired (weights 229GB + KV + buffers)."
 echo "   - Weights are on local disk (required: mmap page faults over NFS are brutal)."
 

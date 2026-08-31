@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly SCRIPT_NAME=${0:t}
-readonly RUNTIME_DIR=$HOME/Hy4
+readonly RUNTIME_DIR="${HOME}/Hy4"
 readonly PORT=8019
 readonly PID_FILE="$RUNTIME_DIR/hy4.pid"
 readonly LOG_FILE="$RUNTIME_DIR/hy4.log"
