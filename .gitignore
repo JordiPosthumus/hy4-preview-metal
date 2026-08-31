@@ -6,3 +6,12 @@ build-*/
 __pycache__/
 .DS_Store
 llama.cpp/
+
+# compiled benchmarks / test binaries (embed local paths via rpath)
+bench/bench
+bench_q1_0
+bench_q8_0
+bench_stq1_0
+test_stq1_0_metal
+*.o
+*.dylib

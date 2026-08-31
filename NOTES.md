@@ -36,8 +36,9 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
 
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).
-Experts at 94 GB/s -> est. ~9-10 tok/s (was ~6 with v0). Compare: other resident MoE models on this class of machine ~12-15,
-a smaller MTP-speculating model ~27-31.
+Experts at 94 GB/s -> est. ~9-10 tok/s (was ~6 with v0). For reference, the other MoE
+models resident on this class of machine run roughly 12-15 tok/s, and a smaller
+MTP-speculating model reaches ~27-31 tok/s.
 
 ## Process notes (avoid freezes)
 - Never block on GPU: poll command buffer status with hard timeout (see bench/bench.mm)
