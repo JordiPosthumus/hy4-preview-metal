@@ -15,3 +15,6 @@ bench_stq1_0
 test_stq1_0_metal
 *.o
 *.dylib
+
+# private session notes — never publish (local paths, infra, fleet refs)
+SESSION-NOTES.md
