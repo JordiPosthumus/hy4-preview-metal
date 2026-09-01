@@ -33,7 +33,7 @@ struct mvargs {
 // returns false on timeout
 static bool run_and_wait(id<MTLCommandQueue> q, id<MTLComputePipelineState> ps,
                          id<MTLBuffer> abuf, id<MTLBuffer> wbuf, id<MTLBuffer> ybuf, id<MTLBuffer> dbuf,
-                         int grid_x, int tg_threads, double timeout_s, double * out_sec) {
+                         int grid_x, int tg_threads, size_t tmem, double timeout_s, double * out_sec) {
     id<MTLCommandBuffer> cb = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:ps];
@@ -41,6 +41,7 @@ static bool run_and_wait(id<MTLCommandQueue> q, id<MTLComputePipelineState> ps,
     [enc setBuffer:wbuf offset:0 atIndex:1];
     [enc setBuffer:ybuf offset:0 atIndex:2];
     [enc setBuffer:dbuf offset:0 atIndex:3];
+    [enc setThreadgroupMemoryLength:tmem atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(grid_x, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg_threads, 1, 1)];
     [enc endEncoding];
     [cb commit];
@@ -153,9 +154,14 @@ int main(int argc, char ** argv) {
                                     "kernel_mv_v4_2x8", "kernel_mv_v4_4x8",
                                     "kernel_mv_v2_4x8", "kernel_mv_v2_8x4", "kernel_mv_v2_2x8", "kernel_mv_v4b_2x8",
                                     "kernel_mv_v2_2x16", "kernel_mv_v7_charfull_2x16",
-                                    "kernel_mv_v8_fourblock_charfull_2x16" };
-        const int nsgs[] = { 2, 4, 4, 2, 2, 4, 4, 8, 8, 8, 4, 8, 8, 16, 16, 16 };
-        const int nr0s[] = { 8, 4, 4, 4, 8, 4, 8, 2, 4, 4, 8, 2, 2, 2, 2, 2 };
+                                    "kernel_mv_v8_fourblock_charfull_2x16",
+                                    "kernel_mv_diag_yonly_2x16", "kernel_mv_diag_decodeonly_2x16",
+                                    "kernel_mv_v11_shy_2x16", "kernel_mv_v11_shy_2x8",
+                                    "kernel_mv_v11_shy_2x4", "kernel_mv_v11_shy_4x8" };
+        const int nsgs[] = { 2, 4, 4, 2, 2, 4, 4, 8, 8, 8, 4, 8, 8, 16, 16, 16, 16, 16, 16, 8, 4, 8 };
+        const int nr0s[] = { 8, 4, 4, 4, 8, 4, 8, 2, 4, 4, 8, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4 };
+        const int tmemf[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1 };
+        const int n_variants = sizeof(variants)/sizeof(variants[0]);
 
         id<MTLCommandQueue> q = [dev newCommandQueue];
         id<MTLComputePipelineState> thrash_ps = nil;
@@ -175,7 +181,7 @@ int main(int argc, char ** argv) {
             id<MTLComputePipelineState> warm_ps = [dev newComputePipelineStateWithFunction:warm_fn error:&err];
             double warm_sec = 0;
             for (int i = 0; i < 64; ++i) {
-                if (!run_and_wait(q, warm_ps, abuf, wbuf, ybuf, dbuf, ne01/16, 32*8, 15.0, &warm_sec)) {
+                if (!run_and_wait(q, warm_ps, abuf, wbuf, ybuf, dbuf, ne01/16, 32*8, 0, 15.0, &warm_sec)) {
                     printf("hardware warmup failed\n");
                     return 1;
                 }
@@ -183,9 +189,10 @@ int main(int argc, char ** argv) {
         }
 
         const bool reverse = getenv("BENCH_REVERSE") != nullptr;
-        for (int step = 0; step < 16; ++step) {
-            const int v = reverse ? 15 - step : step;
-            if (filter && !strstr(filter, variants[v])) continue;
+        for (int step = 0; step < n_variants; ++step) {
+            const int v = reverse ? n_variants - 1 - step : step;
+            // filter matches a substring of the full variant name
+            if (filter && !strstr(variants[v], filter)) continue;
             printf("[variant] %s\n", variants[v]); fflush(stdout);
             id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:variants[v]]];
             if (!fn) { printf("  MISSING\n"); continue; }
@@ -198,7 +205,8 @@ int main(int argc, char ** argv) {
             const int grid_x = ne01 / tg_rows;
 
             double sec = 0;
-            if (!run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, 15.0, &sec)) {
+            const size_t tmem = tmemf[v] ? (size_t)ne00*sizeof(float) : 0;
+            if (!run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, tmem, 15.0, &sec)) {
                 printf("  FAILED/TIMEOUT\n"); continue;
             }
 
@@ -220,11 +228,11 @@ int main(int argc, char ** argv) {
             // timing
             double tot = 0;
             bool ok = true;
-            for (int i = 0; i < 3; ++i) ok &= run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, 15.0, &sec);
+            for (int i = 0; i < 3; ++i) ok &= run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, tmem, 15.0, &sec);
             for (int i = 0; i < iters && ok; ++i) {
                 if (cold_cache) ok = thrash_and_wait(q, thrash_ps, thrash_buf, 15.0);
                 if (!ok) break;
-                ok = run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, 15.0, &sec);
+                ok = run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, tmem, 15.0, &sec);
                 tot += sec;
             }
             if (!ok) { printf("  FAILED/TIMEOUT in timing\n"); continue; }

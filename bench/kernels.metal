@@ -345,6 +345,179 @@ kernel void kernel_mv_v8_fourblock_charfull_2x16(constant mvargs & args, device 
                                                  uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     mv_impl_v4<2,16,2>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
+
+// ---- diagnostics: isolate y-load cost (no decode) and decode cost (no y) ----
+// diag_yonly: same y float4 loads + dot as v9/nr2, but no weight decode (fixed lv).
+// diag_decodeonly: decodes weights but does trivial accumulate (no y loads / dots).
+template<int NR0, int NSG, int MODE>
+void mv_impl_diag(constant mvargs & args,
+                  device const char * src0,
+                  device const float * y,
+                  device float * dst,
+                  uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int nb = args.ne00 / 256;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    device const block_stq * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_stq *)(src0 + (first_row + row) * args.nb01);
+    }
+
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / 8;
+    const short t8 = tiisg % 8;
+    const int chunk = t8 >> 1;
+    const int gbase = (t8 & 1) << 3;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        device const float * yb = y + r1*args.ne00 + ib*256 + chunk*64 + gbase;
+        const float4 yv0a = *(device const float4 *)(yb);
+        const float4 yv0b = *(device const float4 *)(yb + 4);
+        const float4 yv1a = *(device const float4 *)(yb + 16);
+        const float4 yv1b = *(device const float4 *)(yb + 20);
+        const float4 yv2a = *(device const float4 *)(yb + 32);
+        const float4 yv2b = *(device const float4 *)(yb + 36);
+        const float4 yv3a = *(device const float4 *)(yb + 48);
+        const float4 yv3b = *(device const float4 *)(yb + 52);
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const block_stq * bx = ax[row] + ib;
+            const ushort qlo = *(device const ushort *)(bx->qs + 4*t8);
+            const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
+            const uint  q32 = (uint)qlo | ((uint)qhi << 16);
+            const uchar s8  = bx->sign[t8];
+            const float d = bx->d;
+            float sum = 0.f;
+            FOR_UNROLL (short j = 0; j < 8; j++) {
+                if (MODE == 0) {
+                    // no decode: fixed value, still touches y (memory traffic identical)
+                    const float4 yy = j < 4
+                        ? float4(yv0a[j], yv1a[j], yv2a[j], yv3a[j])
+                        : float4(yv0b[j-4], yv1b[j-4], yv2b[j-4], yv3b[j-4]);
+                    sum += dot(float4(1.f, -1.f, 1.f, -1.f), yy);
+                } else {
+                    // decode but cheap accumulate: no y loads, no gather needed value
+                    const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
+                    const uint code  = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
+                    const uint b     = (s8 >> j) & 1;
+                    const float4 lv  = float4(stq_cb4_full[(b << 4) | code]);
+                    sum += lv.x + lv.y + lv.z + lv.w;
+                }
+            }
+            sumf[row] += (MODE == 0) ? sum : d * sum;
+        }
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[(uint64_t)r1*args.ne0 + first_row + row] = tot;
+        }
+    }
+}
+kernel void kernel_mv_diag_yonly_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                      uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_diag<2,16,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_diag_decodeonly_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                           uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_diag<2,16,1>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+
+// ---- v11: shared-memory y. Load the full y[ne00] into threadgroup memory once,
+// then all threads/rows read y from fast shared memory. Keeps NR0 small (no
+// register blowup) while cutting device y re-reads to once per threadgroup.
+template<int NR0, int NSG>
+void mv_impl_v11(constant mvargs & args,
+                 device const char * src0,
+                 device const float * y,
+                 device float * dst,
+                 threadgroup float * ysh,
+                 uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int nb = args.ne00 / 256;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+    const int nthreads = 32 * NSG;
+
+    // cooperative load of y into shared memory (threadgroup is per (r0) group of rows)
+    for (int i = tiisg + sgitg*32; i < args.ne00; i += nthreads) {
+        ysh[i] = y[r1*args.ne00 + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const block_stq * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_stq *)(src0 + (first_row + row) * args.nb01);
+    }
+
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / 8;
+    const short t8 = tiisg % 8;
+    const int chunk = t8 >> 1;
+    const int gbase = (t8 & 1) << 3;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        const float4 yv0a = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase);
+        const float4 yv0b = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase + 4);
+        const float4 yv1a = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase + 16);
+        const float4 yv1b = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase + 20);
+        const float4 yv2a = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase + 32);
+        const float4 yv2b = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase + 36);
+        const float4 yv3a = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase + 48);
+        const float4 yv3b = *(threadgroup const float4 *)(ysh + ib*256 + chunk*64 + gbase + 52);
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const block_stq * bx = ax[row] + ib;
+            const ushort qlo = *(device const ushort *)(bx->qs + 4*t8);
+            const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
+            const uint  q32 = (uint)qlo | ((uint)qhi << 16);
+            const uchar s8  = bx->sign[t8];
+            const float d = bx->d;
+            float sum = 0.f;
+            FOR_UNROLL (short j = 0; j < 8; j++) {
+                const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
+                const uint code  = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
+                const uint b     = (s8 >> j) & 1;
+                const float4 lv  = float4(stq_cb4_full[(b << 4) | code]);
+                const float4 yy = j < 4
+                    ? float4(yv0a[j], yv1a[j], yv2a[j], yv3a[j])
+                    : float4(yv0b[j-4], yv1b[j-4], yv2b[j-4], yv3b[j-4]);
+                sum += dot(lv, yy);
+            }
+            sumf[row] += d * sum;
+        }
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[(uint64_t)r1*args.ne0 + first_row + row] = tot;
+        }
+    }
+}
+kernel void kernel_mv_v11_shy_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                   threadgroup float * ysh [[threadgroup(0)]],
+                                   uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v11<2,16>(args, src0, y, dst, ysh, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v11_shy_2x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                  threadgroup float * ysh [[threadgroup(0)]],
+                                  uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v11<2,8>(args, src0, y, dst, ysh, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v11_shy_2x4(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                  threadgroup float * ysh [[threadgroup(0)]],
+                                  uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v11<2,4>(args, src0, y, dst, ysh, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v11_shy_4x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                  threadgroup float * ysh [[threadgroup(0)]],
+                                  uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v11<4,8>(args, src0, y, dst, ysh, tgpig, tiisg, sgitg);
+}
 template<int NR0, int NSG>
 void mv_impl_v4b(constant mvargs & args,
                 device const char * src0,
