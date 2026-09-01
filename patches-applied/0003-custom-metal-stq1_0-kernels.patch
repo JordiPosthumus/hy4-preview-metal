@@ -1,4 +1,4 @@
-From 34e29e5 Mon Sep 17 00:00:00 2001
+From 2bdb568 Mon Sep 17 00:00:00 2001
 From: JordiPosthumus <jordiposthumus@users.noreply.github.com>
 Date: Tue, 1 Sep 2026 08:02:00 -0300
 Subject: [PATCH] STQ1_0 Metal kernels: tuned decode and cooperative prefill
@@ -10,7 +10,8 @@ Adds complete Apple Metal support for Hy4 STQ1_0 and carries the validated
 M3 Ultra tuning for decode, small batches, prefill, and routed experts.
 
 - Decode uses the four-block group-aligned char4 path, y-column hoisting,
-  split accumulators, and the production 2-row/16-SIMD-group schedule.
+  component-wise ternary-lane accumulators, and the production
+  2-row/16-SIMD-group schedule.
 - Legacy prefill and mul_mat_id cooperatively decode 16 ternary groups with
   two threads per row, retaining adjacent lanes so each 32-weight tile needs
   16 rather than 32 codebook gathers.
@@ -24,6 +25,12 @@ max absolute error remains 0.0000/0.0001/0.0232. Against the pre-loop library,
 batch-32/64/128 prefill won every alternating A/B pair with roughly 17-26%
 lower best time; one-expert mul_mat_id won all five final pairs by 8-14% with
 identical 0.01809 reference error.
+
+An additional raw-Metal decode A/B at the exact 6144x2048 shape won all eight
+alternating-order pairs after splitting the four ternary components into
+independent FMA chains. Average GPU time fell from 0.03225 to 0.02625 ms
+(-18.6%), average effective bandwidth rose from 64.4 to 78.9 GB/s (+22.5%),
+and max absolute error improved from 1.84e-05 to 1.51e-05.
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
 index 270c141..71ee466 100644
@@ -196,7 +203,7 @@ index 969fddf..4b2d639 100644
  template <typename type4x4>
  void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
      device const uint8_t * qs = xb->qs;
-@@ -3695,6 +3801,118 @@ kernel void kernel_mul_mv_q1_0_f32(
+@@ -3695,6 +3801,123 @@ kernel void kernel_mul_mv_q1_0_f32(
      kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
  }
  
@@ -274,18 +281,23 @@ index 969fddf..4b2d639 100644
 +            const uchar sb = bx->sign[t8];
 +            const float d = bx->d;
 +
-+            float sum0 = 0.f, sum1 = 0.f;
++            // Accumulate the four ternary lanes independently. This exposes the
++            // component FMAs to the scheduler and shortens each dependency chain
++            // without adding codebook gathers or changing the thread mapping.
++            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
 +            FOR_UNROLL (short j = 0; j < 8; j++) {
 +                const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
 +                const uint code = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
 +                const uint b    = (sb >> j) & 1;
 +                const float4 lv = float4(stq1_0_codebook_vec[(b << 4) | code]);
-+                // two independent accumulators cut the FMA dependency chain in half
-+                if (j & 1) sum1 += dot(lv, ycol[j]);
-+                else       sum0 += dot(lv, ycol[j]);
++                const float4 yj = ycol[j];
++                a0 += lv.x*yj.x;
++                a1 += lv.y*yj.y;
++                a2 += lv.z*yj.z;
++                a3 += lv.w*yj.w;
 +            }
 +
-+            sumf[row] += d * (sum0 + sum1);
++            sumf[row] += d * ((a0 + a1) + (a2 + a3));
 +        }
 +    }
 +

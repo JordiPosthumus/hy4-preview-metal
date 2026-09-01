@@ -129,6 +129,25 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
   accepted head. A clean local 0001 -> 0002 -> 0003 apply reproduced byte-for-byte
   hashes for all four exported Metal files.
 
+## Component-wise decode accumulation (2026-09-01 autoresearch, second pass)
+- Replaced the two `dot(float4, float4)` reduction chains in the production
+  STQ1_0 matvec with four independent component FMA chains and a balanced final
+  reduction. The group-aligned mapping, compact `char4` codebook, load count,
+  2-row/16-SIMD-group dispatch, and every runtime setting remain unchanged.
+- On the exact 6144x2048 expert shape, the raw-Metal GPU-timestamp harness won
+  all eight alternating-order pairs. Average kernel time was 0.02625 ms versus
+  0.03225 ms (-18.6%); average effective bandwidth was 78.9 versus 64.4 GB/s
+  (+22.5%). Max absolute error improved from 1.84e-05 to 1.51e-05.
+- The rebuilt ggml library still passes BS=1/8/32 at
+  0.0000/0.0001/0.0232 maximum absolute error. The final synthetic decode
+  process used 47,824,896 bytes maximum RSS; no model was loaded.
+- Rejected and not shipped in this pass: removing an MMA feed barrier; scatter
+  address flattening; caching decoded lanes or packed scalars across K tiles;
+  direct device-to-half MMA activation loads (unsupported type conversion);
+  a phased 6 KiB routed-output slab; explicit packed-q pairing; 4-row decode;
+  and a native `float4` codebook. These were neutral, noisy, unsupported, or
+  materially slower (several by roughly 2x).
+
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).
 Experts at 94 GB/s -> est. ~9-10 tok/s (was ~6 with v0). For reference, the other MoE

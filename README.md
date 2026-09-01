@@ -58,6 +58,13 @@ error, and the rebuilt ggml library still passed BS=1/8/32 at 0.0000/0.0001/0.02
 The sweep used a 2.1 MB synthetic matrix and an optional bounded 128 MB cache-thrash
 buffer; the 229 GB model was not loaded, so end-to-end impact remains unmeasured.
 
+A second decode pass changed only the reduction schedule: the four ternary
+components now accumulate in independent FMA chains before a balanced final sum.
+At the exact 6144x2048 expert shape it won all eight alternating-order GPU-timestamp
+pairs, cutting average kernel time from 0.03225 to 0.02625 ms (-18.6%) and raising
+average effective bandwidth from 64.4 to 78.9 GB/s (+22.5%). Max absolute error
+improved from 1.84e-05 to 1.51e-05. The full model was not loaded for this work.
+
 Prefill: the legacy Metal `mul_mm` and routed `mul_mm_id` paths now use a cooperative
 STQ1_0 loader. Two threads per A row split the ternary groups and keep adjacent p lanes,
 halving codebook gathers per 32-weight tile; native `half2` codebook views avoid the
