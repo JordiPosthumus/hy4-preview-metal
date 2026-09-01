@@ -22,20 +22,30 @@ int main(int argc, char ** argv) {
     const int nops  = argc > 4 ? atoi(argv[4]) : 32;     // identical ops in graph
     const int reps  = argc > 5 ? atoi(argv[5]) : 10;
 
+    if (ne00 <= 0 || ne00 % 256 != 0 || ne01 <= 0 || batch <= 0 ||
+        nops <= 0 || nops > 256 || reps <= 0) {
+        fprintf(stderr, "usage: %s [columns-multiple-of-256] [rows] [batch] [ops-1..256] [repetitions]\n", argv[0]);
+        return 2;
+    }
+
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.f, 1.f);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    std::uniform_real_distribution<float> scale_dist(0.25f, 0.75f);
 
-    std::vector<float> w((size_t)ne01 * ne00);
-    for (auto & v : w) v = dist(rng);
     std::vector<block_stq1_0> wq((size_t)ne01 * ggml_row_size(GGML_TYPE_STQ1_0, ne00) / sizeof(block_stq1_0));
-    quantize_stq1_0(w.data(), wq.data(), ne01, ne00, nullptr);
+    for (auto & block : wq) {
+        for (auto & q : block.qs) q = (uint8_t) byte_dist(rng);
+        for (auto & s : block.sign) s = (uint8_t) byte_dist(rng);
+        block.d = ggml_fp32_to_fp16(scale_dist(rng));
+    }
     std::vector<float> x((size_t)batch * ne00);
     for (auto & v : x) v = dist(rng);
 
     ggml_backend_t mb = ggml_backend_metal_init();
     if (!mb) { printf("Metal init failed\n"); return 1; }
 
-    struct ggml_init_params ip = { 512ull*1024*1024, NULL, true };
+    struct ggml_init_params ip = { 16ull*1024*1024, NULL, true };
     struct ggml_context * ctx = ggml_init(ip);
     struct ggml_tensor * A = ggml_new_tensor_2d(ctx, GGML_TYPE_STQ1_0, ne00, ne01);
     struct ggml_tensor * X = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne00, batch);
