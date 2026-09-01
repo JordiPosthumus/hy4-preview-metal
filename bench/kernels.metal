@@ -426,7 +426,259 @@ kernel void kernel_mv_diag_decodeonly_2x16(constant mvargs & args, device const 
     mv_impl_diag<2,16,1>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 
-// ---- v11: shared-memory y. Load the full y[ne00] into threadgroup memory once,
+// ---- v18: v8 four-block charfull decode, y-column hoisted + 2-way accumulator split.
+// Hoists the 8 float4 y-columns out of the NR0 row loop (they only depend on the
+// block, not the row) and splits the per-thread accumulator to shorten the FMA
+// dependency chain. Same group-aligned mapping and 42B-safe ushort loads as v8.
+template<int NR0, int NSG>
+void mv_impl_v18(constant mvargs & args,
+                 device const char * src0,
+                 device const float * y,
+                 device float * dst,
+                 uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int nb = args.ne00 / 256;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    device const block_stq * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_stq *)(src0 + (first_row + row) * args.nb01);
+    }
+
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / 8;
+    const short t8 = tiisg % 8;
+    const int chunk = t8 >> 1;
+    const int gbase = (t8 & 1) << 3;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        device const float * yb = y + r1*args.ne00 + ib*256 + chunk*64 + gbase;
+        const float4 yv0a = *(device const float4 *)(yb);
+        const float4 yv0b = *(device const float4 *)(yb + 4);
+        const float4 yv1a = *(device const float4 *)(yb + 16);
+        const float4 yv1b = *(device const float4 *)(yb + 20);
+        const float4 yv2a = *(device const float4 *)(yb + 32);
+        const float4 yv2b = *(device const float4 *)(yb + 36);
+        const float4 yv3a = *(device const float4 *)(yb + 48);
+        const float4 yv3b = *(device const float4 *)(yb + 52);
+        // 8 y-columns (one per group), shared by all NR0 rows
+        const float4 ycol0 = float4(yv0a.x, yv1a.x, yv2a.x, yv3a.x);
+        const float4 ycol1 = float4(yv0a.y, yv1a.y, yv2a.y, yv3a.y);
+        const float4 ycol2 = float4(yv0a.z, yv1a.z, yv2a.z, yv3a.z);
+        const float4 ycol3 = float4(yv0a.w, yv1a.w, yv2a.w, yv3a.w);
+        const float4 ycol4 = float4(yv0b.x, yv1b.x, yv2b.x, yv3b.x);
+        const float4 ycol5 = float4(yv0b.y, yv1b.y, yv2b.y, yv3b.y);
+        const float4 ycol6 = float4(yv0b.z, yv1b.z, yv2b.z, yv3b.z);
+        const float4 ycol7 = float4(yv0b.w, yv1b.w, yv2b.w, yv3b.w);
+        const float4 ycol[8] = { ycol0, ycol1, ycol2, ycol3, ycol4, ycol5, ycol6, ycol7 };
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const block_stq * bx = ax[row] + ib;
+            const ushort qlo = *(device const ushort *)(bx->qs + 4*t8);
+            const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
+            const uint  q32 = (uint)qlo | ((uint)qhi << 16);
+            const uchar s8  = bx->sign[t8];
+            const float d = bx->d;
+            float sum0 = 0.f, sum1 = 0.f;
+            FOR_UNROLL (short j = 0; j < 8; j++) {
+                const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
+                const uint code  = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
+                const uint b     = (s8 >> j) & 1;
+                const float4 lv  = float4(stq_cb4_full[(b << 4) | code]);
+                if (j & 1) sum1 += dot(lv, ycol[j]);
+                else       sum0 += dot(lv, ycol[j]);
+            }
+            sumf[row] += d * (sum0 + sum1);
+        }
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[(uint64_t)r1*args.ne0 + first_row + row] = tot;
+        }
+    }
+}
+kernel void kernel_mv_v18_hoist2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                    uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v18<2,16>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v18_hoist4x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                    uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v18<4,16>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v18_hoist4x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                   uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v18<4,8>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v18_hoist8x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                   uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v18<8,8>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v18_hoist8x4(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                   uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v18<8,4>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+
+// ---- v19: v18 + all 8 y-columns hoisted but 4-way accumulator (full ILP) and
+// the char4 codebook gathered once into float4 registers before the row loop.
+// Decode cost is shared across NR0 rows since weights differ but the y-columns
+// are the same; gather the codebook into float4 once per (row) here anyway.
+template<int NR0, int NSG>
+void mv_impl_v19(constant mvargs & args,
+                 device const char * src0,
+                 device const float * y,
+                 device float * dst,
+                 uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int nb = args.ne00 / 256;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    device const block_stq * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_stq *)(src0 + (first_row + row) * args.nb01);
+    }
+
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / 8;
+    const short t8 = tiisg % 8;
+    const int chunk = t8 >> 1;
+    const int gbase = (t8 & 1) << 3;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        device const float * yb = y + r1*args.ne00 + ib*256 + chunk*64 + gbase;
+        const float4 yv0a = *(device const float4 *)(yb);
+        const float4 yv0b = *(device const float4 *)(yb + 4);
+        const float4 yv1a = *(device const float4 *)(yb + 16);
+        const float4 yv1b = *(device const float4 *)(yb + 20);
+        const float4 yv2a = *(device const float4 *)(yb + 32);
+        const float4 yv2b = *(device const float4 *)(yb + 36);
+        const float4 yv3a = *(device const float4 *)(yb + 48);
+        const float4 yv3b = *(device const float4 *)(yb + 52);
+        const float4 ycol[8] = {
+            float4(yv0a.x, yv1a.x, yv2a.x, yv3a.x), float4(yv0a.y, yv1a.y, yv2a.y, yv3a.y),
+            float4(yv0a.z, yv1a.z, yv2a.z, yv3a.z), float4(yv0a.w, yv1a.w, yv2a.w, yv3a.w),
+            float4(yv0b.x, yv1b.x, yv2b.x, yv3b.x), float4(yv0b.y, yv1b.y, yv2b.y, yv3b.y),
+            float4(yv0b.z, yv1b.z, yv2b.z, yv3b.z), float4(yv0b.w, yv1b.w, yv2b.w, yv3b.w)
+        };
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const block_stq * bx = ax[row] + ib;
+            const ushort qlo = *(device const ushort *)(bx->qs + 4*t8);
+            const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
+            const uint  q32 = (uint)qlo | ((uint)qhi << 16);
+            const uchar s8  = bx->sign[t8];
+            const float d = bx->d;
+            float a0=0.f,a1=0.f,a2=0.f,a3=0.f;
+            FOR_UNROLL (short j = 0; j < 8; j++) {
+                const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
+                const uint code  = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
+                const uint b     = (s8 >> j) & 1;
+                const float4 lv  = float4(stq_cb4_full[(b << 4) | code]);
+                const float4 yj  = ycol[j];
+                a0 += lv.x*yj.x; a1 += lv.y*yj.y; a2 += lv.z*yj.z; a3 += lv.w*yj.w;
+            }
+            sumf[row] += d * ((a0+a1)+(a2+a3));
+        }
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[(uint64_t)r1*args.ne0 + first_row + row] = tot;
+        }
+    }
+}
+kernel void kernel_mv_v19_4acc_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                    uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v19<2,16>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v19_4acc_2x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                   uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v19<2,8>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+
+// ---- v20: v18 y-column-hoisted structure but arithmetic codebook decode (no
+// table gather). The notes rejected arithmetic under the old mapping (58-64 vs
+// 85-94 GB/s) because Apple GPUs like small hot LUTs; re-tested here because the
+// hoisted y-columns change the instruction mix and the gather is the suspected
+// cost. Uses the algebraically-derived decode (slot = zero-pos + sign bits).
+template<int NR0, int NSG>
+void mv_impl_v20(constant mvargs & args,
+                 device const char * src0,
+                 device const float * y,
+                 device float * dst,
+                 uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int nb = args.ne00 / 256;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    device const block_stq * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_stq *)(src0 + (first_row + row) * args.nb01);
+    }
+
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / 8;
+    const short t8 = tiisg % 8;
+    const int chunk = t8 >> 1;
+    const int gbase = (t8 & 1) << 3;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        device const float * yb = y + r1*args.ne00 + ib*256 + chunk*64 + gbase;
+        const float4 yv0a = *(device const float4 *)(yb);
+        const float4 yv0b = *(device const float4 *)(yb + 4);
+        const float4 yv1a = *(device const float4 *)(yb + 16);
+        const float4 yv1b = *(device const float4 *)(yb + 20);
+        const float4 yv2a = *(device const float4 *)(yb + 32);
+        const float4 yv2b = *(device const float4 *)(yb + 36);
+        const float4 yv3a = *(device const float4 *)(yb + 48);
+        const float4 yv3b = *(device const float4 *)(yb + 52);
+        const float4 ycol[8] = {
+            float4(yv0a.x, yv1a.x, yv2a.x, yv3a.x), float4(yv0a.y, yv1a.y, yv2a.y, yv3a.y),
+            float4(yv0a.z, yv1a.z, yv2a.z, yv3a.z), float4(yv0a.w, yv1a.w, yv2a.w, yv3a.w),
+            float4(yv0b.x, yv1b.x, yv2b.x, yv3b.x), float4(yv0b.y, yv1b.y, yv2b.y, yv3b.y),
+            float4(yv0b.z, yv1b.z, yv2b.z, yv3b.z), float4(yv0b.w, yv1b.w, yv2b.w, yv3b.w)
+        };
+
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const block_stq * bx = ax[row] + ib;
+            const ushort qlo = *(device const ushort *)(bx->qs + 4*t8);
+            const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
+            const uint  q32 = (uint)qlo | ((uint)qhi << 16);
+            const uchar s8  = bx->sign[t8];
+            const float d = bx->d;
+            float sum = 0.f;
+            FOR_UNROLL (short j = 0; j < 8; j++) {
+                const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
+                const uint code  = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
+                const uint b     = (s8 >> j) & 1;
+                const uchar qpack = stq_decode_arith(code, b);
+                const float l0 = (float)((int)(qpack        & 3) - 1);
+                const float l1 = (float)((int)((qpack >> 2) & 3) - 1);
+                const float l2 = (float)((int)((qpack >> 4) & 3) - 1);
+                const float l3 = (float)((int)((qpack >> 6) & 3) - 1);
+                const float4 yj = ycol[j];
+                sum += l0*yj.x + l1*yj.y + l2*yj.z + l3*yj.w;
+            }
+            sumf[row] += d * sum;
+        }
+    }
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[(uint64_t)r1*args.ne0 + first_row + row] = tot;
+        }
+    }
+}
+kernel void kernel_mv_v20_arith_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                     uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v20<2,16>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
 // then all threads/rows read y from fast shared memory. Keeps NR0 small (no
 // register blowup) while cutting device y re-reads to once per threadgroup.
 template<int NR0, int NSG>

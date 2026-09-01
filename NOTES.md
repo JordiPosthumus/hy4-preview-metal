@@ -64,6 +64,26 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
 - The model was not loaded; the test allocation remained a 2.1 MB matrix plus the
   optional bounded 128 MB cache-thrash buffer.
 
+## y-column hoist follow-up (2026-09-01)
+- The four-block charfull decode rebuilt its eight per-group float4 y-columns inside
+  the NR0=2 row loop even though they depend only on the block. Hoisting them out
+  (one construction per block iteration) plus splitting the accumulator into two
+  independent chains gave a real but modest gain: ~4-5% at the 6144xN expert
+  aggregate, ~3% at 16384x16384, neutral at a single 6144x2048 expert (same-process
+  paired A/B). Correctness unchanged (0.0000/0.0001/0.0232 at BS 1/8/32).
+- **Decode is near its practical ceiling.** Diagnostic kernels decompose the cost:
+  at 16384x16384, "y + dot only" (no decode) reaches ~272 GB/s while the full
+  four-block kernel is ~250-270 after the hoist — i.e. the scalar float dot, not the
+  codebook gather, is the binding constraint, and the kernel is essentially there.
+  Higher NR0 (4/8) fails even after the hoist via register spilling (50-150 GB/s),
+  shared-memory y (v11) gives nothing, and the arithmetic decode is still slower
+  than the char4 table gather on Apple (81 vs 200+ GB/s, confirming the earlier
+  rejection). No int8/int16 simdgroup_matrix element type exists on this Metal
+  compiler (float/half/bfloat only), so there is no hardware integer-MMA lever for
+  the scalar decode; the batch-1 matvec has no weight reuse to amortize either.
+  The remaining big-kernel lever is the simdgroup_half8x8 mm/prefill path, which is
+  currently dequantize-to-shared bound at ~22 GB/s (q1_0 parity).
+
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).
 Experts at 94 GB/s -> est. ~9-10 tok/s (was ~6 with v0). For reference, the other MoE
