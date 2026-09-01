@@ -100,6 +100,35 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
   generic template's per-il interface forces the element-offset mapping. Left as
   the clear next kernel project.
 
+## Cooperative prefill + routed decode (2026-09-01 autoresearch)
+- Implemented a specialized legacy-Metal loader for `mul_mm` and `mul_mm_id`.
+  The two threads assigned to an A row split its 16 ternary groups and retain
+  both adjacent p lanes from each lookup, cutting a 32-weight tile from 32 to
+  16 codebook gathers without changing the shared A layout or MMA order.
+- Split native `half2` low/high codebook views remove `char2 -> half2`
+  conversion. They added a smaller repeatable gain: all four normal pairs won
+  by roughly 0.3-2.5%, and all four routed pairs by 2.7-3.3% against the
+  cooperative-loader-only build.
+- Final alternating A/B against the pre-loop library won every comparison:
+  batch 32 cut best time 18.5-19.3%, batch 64 cut 19.9-21.9%, and batch 128
+  cut 16.7-25.9%. The one-expert `mul_mat_id` harness won all five final pairs
+  by 7.6-13.7%. Background GPU activity made means noisy, so claims use the
+  paired best times.
+- Correctness is unchanged: BS1/BS8/BS32 remains
+  0.0000/0.0001/0.0232 maximum absolute error. The independent routed float64
+  sample is exactly 0.01809 for both the old and new libraries.
+- Rejected and not shipped: caching the unused p pair in an extra 4 KiB shared
+  tile (routed ~9% slower); 64x64 and 32x64 output tiles; packed-byte q loads;
+  explicit q-byte reuse; activation prefetch across the barrier; and vector or
+  split-scalar small-batch codebooks. These were neutral, slower, or failed the
+  initial correctness gate before correction.
+- No model was loaded. The final timed prefill process used 51,249,152 bytes
+  maximum RSS (365,691,648-byte OS peak footprint), one 2.1 MB synthetic weight
+  matrix, and a 16 MiB ggml metadata arena.
+- Regenerated `patches-applied/0003-custom-metal-stq1_0-kernels.patch` from the
+  accepted head. A clean local 0001 -> 0002 -> 0003 apply reproduced byte-for-byte
+  hashes for all four exported Metal files.
+
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).
 Experts at 94 GB/s -> est. ~9-10 tok/s (was ~6 with v0). For reference, the other MoE

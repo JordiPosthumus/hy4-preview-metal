@@ -58,10 +58,13 @@ error, and the rebuilt ggml library still passed BS=1/8/32 at 0.0000/0.0001/0.02
 The sweep used a 2.1 MB synthetic matrix and an optional bounded 128 MB cache-thrash
 buffer; the 229 GB model was not loaded, so end-to-end impact remains unmeasured.
 
-Prefill: the shipped path uses llama.cpp's generic `mul_mm` template instantiated with the
-STQ1_0 dequant. A dedicated prefill kernel measured in the standalone harness reached
-22 GB/s vs q1_0's 24 GB/s (BS=32) — i.e. the ternary pattern has no structural prefill
-penalty. End-to-end pp/tg numbers are still being measured (see Results).
+Prefill: the legacy Metal `mul_mm` and routed `mul_mm_id` paths now use a cooperative
+STQ1_0 loader. Two threads per A row split the ternary groups and keep adjacent p lanes,
+halving codebook gathers per 32-weight tile; native `half2` codebook views avoid the
+remaining char conversion. On the exact 6144x2048 expert shape, final bounded A/Bs against
+the prior library won every pair: best time fell 18.5-19.3% at batch 32, 19.9-21.9% at
+batch 64, and 16.7-25.9% at batch 128. One-expert routed matmul improved 7.6-13.7% with
+identical reference error. The model was not loaded for these measurements.
 
 Correctness: all three batch paths match a float64 reference to float rounding
 (max abs err 0.0000–0.023 on unit-scale dots; the CPU int8 path is less accurate
