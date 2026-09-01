@@ -84,6 +84,22 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
   The remaining big-kernel lever is the simdgroup_half8x8 mm/prefill path, which is
   currently dequantize-to-shared bound at ~22 GB/s (q1_0 parity).
 
+## Prefill (mul_mm) bottleneck identified (2026-09-01)
+- The generic `kernel_mul_mm_stq1_0_f32` template feeds `dequantize_stq1_0` from
+  shared-memory decode. That dequantizer uses the **element-offset** mapping (each
+  call decodes 16 groups at a single lane p, i.e. one codebook gather per weight)
+  — the exact mapping the decode work showed is ~2x slower than group-aligned.
+- Measured production mul_mm at the expert shape (N-op graph so host overhead
+  amortizes, `bench_mm`): ~20-21 GB/s weight bytes at batch 64/128, matching the
+  notes' earlier 22 GB/s. Register-caching the qs/sign bytes + using the vector
+  codebook changed nothing (~20 GB/s), confirming the 16-per-call gather pattern,
+  not device loads, is the cost.
+- Fixing it needs a **custom group-aligned decode-to-shared mm kernel** (decode a
+  64-weight chunk with 4 gathers instead of 16, then scatter to the half shared
+  tile feeding simdgroup_half8x8). That is a real but substantial rewrite; the
+  generic template's per-il interface forces the element-offset mapping. Left as
+  the clear next kernel project.
+
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).
 Experts at 94 GB/s -> est. ~9-10 tok/s (was ~6 with v0). For reference, the other MoE
