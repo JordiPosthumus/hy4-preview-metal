@@ -189,6 +189,63 @@ int main(int argc, char ** argv) {
         }
 
         const bool reverse = getenv("BENCH_REVERSE") != nullptr;
+
+        // Paired A/B mode: PAIR="a_substr:b_substr" alternates the two matching
+        // variants per iteration and prints a per-rep table. Interleaving in one
+        // process cancels slow GPU-clock drift from the shared machine, which is
+        // the dominant noise source (the notes call it +/-20%).
+        const char * pair = getenv("PAIR");
+        int pv[2] = {-1, -1};
+        if (pair) {
+            char buf[256]; strncpy(buf, pair, 255); buf[255] = 0;
+            char * colon = strchr(buf, ':'); if (!colon) { printf("PAIR needs a:b\n"); return 1; }
+            *colon = 0;
+            const char * sa = buf, * sb = colon + 1;
+            int nfound = 0;
+            for (int i = 0; i < n_variants; ++i) {
+                if (strstr(variants[i], sa)) { pv[0] = i; nfound++; }
+                if (strstr(variants[i], sb)) { pv[1] = i; nfound++; }
+            }
+            if (nfound != 2 || pv[0] == pv[1] || pv[0] < 0 || pv[1] < 0) { printf("PAIR matched %d (need exactly 2 distinct)\n", nfound); return 1; }
+            // prepare both pipelines
+            id<MTLComputePipelineState> pps[2]; double psec[2] = {0,0};
+            for (int k = 0; k < 2; ++k) {
+                int v = pv[k];
+                id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:variants[v]]];
+                pps[k] = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+                if (!pps[k]) { printf("pair %d pipeline err: %s\n", k, err.localizedDescription.UTF8String); return 1; }
+            }
+            const int tg_rows0 = nr0s[pv[0]] * nsgs[pv[0]];
+            const int tg_rows1 = nr0s[pv[1]] * nsgs[pv[1]];
+            if (ne01 % tg_rows0 || ne01 % tg_rows1) { printf("rows not divisible for pair\n"); return 1; }
+            const int gx0 = ne01 / tg_rows0, gx1 = ne01 / tg_rows1;
+            const size_t tm0 = tmemf[pv[0]] ? (size_t)ne00*sizeof(float) : 0;
+            const size_t tm1 = tmemf[pv[1]] ? (size_t)ne00*sizeof(float) : 0;
+            // correctness of A
+            run_and_wait(q, pps[0], abuf, wbuf, ybuf, dbuf, gx0, 32*nsgs[pv[0]], tm0, 15.0, &psec[0]);
+            float * out = (float *)dbuf.contents;
+            double ma = 0, mr = 0;
+            for (int r = 0; r < ne01; ++r) { double ae=fabs(out[r]-ref[r]); double re=ae/(fabs(ref[r])+1e-9); if(ae>ma)ma=ae; if(re>mr)mr=re; }
+            printf("[PAIR] A=%s B=%s @ %dx%d  A_err=(%.2e,%.2e) iters=%d\n", variants[pv[0]], variants[pv[1]], ne00, ne01, ma, mr, iters);
+            // warm both
+            for (int i = 0; i < 4; ++i) {
+                run_and_wait(q, pps[0], abuf, wbuf, ybuf, dbuf, gx0, 32*nsgs[pv[0]], tm0, 15.0, &psec[0]);
+                run_and_wait(q, pps[1], abuf, wbuf, ybuf, dbuf, gx1, 32*nsgs[pv[1]], tm1, 15.0, &psec[1]);
+            }
+            double ta = 0, tb = 0; int na = 0, nb = 0; double ba = 0, bb = 0;
+            const double wbytes = (double)w.size();
+            for (int rep = 0; rep < iters; ++rep) {
+                double sa = 0, sb = 0;
+                if (run_and_wait(q, pps[0], abuf, wbuf, ybuf, dbuf, gx0, 32*nsgs[pv[0]], tm0, 15.0, &sa)) { ta += sa; na++; }
+                if (run_and_wait(q, pps[1], abuf, wbuf, ybuf, dbuf, gx1, 32*nsgs[pv[1]], tm1, 15.0, &sb)) { tb += sb; nb++; }
+            }
+            ba = wbytes*na/ta/1e9; bb = wbytes*nb/tb/1e9;
+            printf("[PAIR] A %-34s %6.3f ms  %4.0f GB/s (n=%d)\n", variants[pv[0]], ta/na*1e3, ba, na);
+            printf("[PAIR] B %-34s %6.3f ms  %4.0f GB/s (n=%d)   A/B ratio %.3f\n", variants[pv[1]], tb/nb*1e3, bb, nb, ba/bb);
+            CHECKPOINT("done");
+            return 0;
+        }
+
         for (int step = 0; step < n_variants; ++step) {
             const int v = reverse ? n_variants - 1 - step : step;
             // filter matches a substring of the full variant name
