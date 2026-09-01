@@ -27,12 +27,42 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
 - v0 element-offset mapping:            45-52 GB/s
 - v2 group-aligned + table, NR0=4/NSG=4: 85-94 GB/s  <-- PORTED to ggml (2.08x)
 - v3 arithmetic codebook decode:         58-64 GB/s  (loses to table gather on Apple GPU)
-- v4 q4_K-style 4-blocks-in-flight:      84 GB/s (no better than v2)
+- v4 packed-decode 4-blocks-in-flight:   84 GB/s (no better than v2 by itself)
 - llama.cpp q1_0 (ternary cousin):       119 GB/s — family ceiling reference
 - Q8_0 (mature int kernel):              396 GB/s
 - Gotcha found: 42B block stride => uint loads misaligned on odd blocks (42%2=2 mod 4);
   must use 2-byte-aligned ushort loads. This was the v4 "wrong results" bug.
 - Benchmarks are noisy ±20%: other the resident model servers models share the GPU.
+
+## Production-shape scheduling follow-up (2026-08-31)
+- GGUF metadata confirms every STQ1_0 tensor is a 6144×2048×256 expert stack.
+- At one exact 6144×2048 expert matrix, GPU timestamps across seven paired runs:
+  NR0=4/NSG=4 median 55 GB/s; NR0=2/NSG=8 median 61 GB/s (+10.9%).
+- A second cold-cache sweep combined NR0=2/NSG=16 with a 32-entry `char4` codebook.
+  Across six alternating-order pairs it beat 2×8 every time, median +7.8%; the
+  cleaned final harness measured 95 vs 88 GB/s.
+- Max absolute error improved slightly from 1.60e-5 to 1.46e-5 against float64.
+- Production Metal configuration and exportable patch now use NR0=2/NSG=16 plus
+  the vector-valued codebook.
+- Rebuilt embedded Metal library passed CPU-vs-Metal paths at BS=1/8/32:
+  max abs error 0.0000 / 0.0001 / 0.0232.
+- Sweep used 2.1 MB of synthetic compressed weights and at most a bounded 128 MB
+  cache-thrash buffer; full model was not loaded and end-to-end throughput was not re-measured.
+
+## Four-block decode follow-up (2026-08-31)
+- Combined the compact `char4` decode with an 8-lane block slice: each SIMD group
+  now advances four blocks per iteration instead of two, while keeping NR0=2/NSG=16.
+- Forced-unroll A/Bs matching production style beat the prior two-block kernel in
+  all six alternating-order cold-cache pairs; median pairwise gain was +12.7%.
+- Absolute bandwidth varied with other GPU work (roughly 54-104 GB/s for the prior
+  kernel and 57-104 GB/s for the new one), so only the within-pair gain is claimed.
+- Max absolute error changed only by float reduction order: 1.46e-5 to 1.84e-5 in
+  the standalone float64 comparison. The rebuilt ggml library again passed BS=1/8/32
+  at 0.0000 / 0.0001 / 0.0232 max error.
+- Rejected: a 24 KiB threadgroup activation cache (86 GB/s vs 96) and a native
+  `float4` codebook (56-70 GB/s vs 96-101). Neither is present in production.
+- The model was not loaded; the test allocation remained a 2.1 MB matrix plus the
+  optional bounded 128 MB cache-thrash buffer.
 
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).
@@ -41,6 +71,7 @@ models resident on this class of machine run roughly 12-15 tok/s, and a smaller
 MTP-speculating model reaches ~27-31 tok/s.
 
 ## Process notes (avoid freezes)
-- Never block on GPU: poll command buffer status with hard timeout (see bench/bench.mm)
+- Never block on GPU: poll command buffer status with hard timeout; use completed
+  command-buffer GPU timestamps for kernel timing (see bench/bench.mm)
 - Long runs: nohup + poll log, never foreground
 - Test data gotcha: random bytes as half -> ~3% inf/nan; use finite scales everywhere

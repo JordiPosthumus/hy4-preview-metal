@@ -1,15 +1,28 @@
 // Standalone STQ1_0 matvec kernel variants for Apple Metal.
-// v0: element-offset mapping, 16 table gathers / 16 weights / row  (current ggml kernel)
+// v0: element-offset mapping, 16 table gathers / 16 weights / row (first working kernel)
 // v2: group-aligned mapping, 4 table gathers / 16 weights / row, float4 y loads
 // v3: group-aligned mapping, arithmetic codebook decode (zero gathers), float4 y loads
+// v7: group-aligned mapping, vector-valued char4 codebook + dot product (shipped decode)
 #include <metal_stdlib>
 using namespace metal;
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
 constant uchar stq_cb[32] = {
     0xA9, 0x89, 0x29, 0x09, 0xA6, 0x86, 0x26, 0x06,
     0x9A, 0x92, 0x1A, 0x12, 0x6A, 0x62, 0x4A, 0x42,
     0x01, 0x21, 0x81, 0xA1, 0x04, 0x24, 0x84, 0xA4,
     0x10, 0x18, 0x90, 0x98, 0x40, 0x48, 0x60, 0x68,
+};
+
+constant char4 stq_cb4_full[32] = {
+    char4( 0,  1,  1,  1), char4( 0,  1, -1,  1), char4( 0,  1,  1, -1), char4( 0,  1, -1, -1),
+    char4( 1,  0,  1,  1), char4( 1,  0, -1,  1), char4( 1,  0,  1, -1), char4( 1,  0, -1, -1),
+    char4( 1,  1,  0,  1), char4( 1, -1,  0,  1), char4( 1,  1,  0, -1), char4( 1, -1,  0, -1),
+    char4( 1,  1,  1,  0), char4( 1, -1,  1,  0), char4( 1,  1, -1,  0), char4( 1, -1, -1,  0),
+    char4( 0, -1, -1, -1), char4( 0, -1,  1, -1), char4( 0, -1, -1,  1), char4( 0, -1,  1,  1),
+    char4(-1,  0, -1, -1), char4(-1,  0,  1, -1), char4(-1,  0, -1,  1), char4(-1,  0,  1,  1),
+    char4(-1, -1,  0, -1), char4(-1,  1,  0, -1), char4(-1, -1,  0,  1), char4(-1,  1,  0,  1),
+    char4(-1, -1, -1,  0), char4(-1,  1, -1,  0), char4(-1, -1,  1,  0), char4(-1,  1,  1,  0),
 };
 
 struct block_stq {
@@ -26,6 +39,14 @@ struct mvargs {
     int      ne0;    // dst row stride (elements)
 };
 
+kernel void kernel_cache_thrash(device uint4 * buf [[buffer(0)]],
+                                uint gid [[thread_position_in_grid]]) {
+    const uint base = gid * 16;
+    for (uint i = 0; i < 16; ++i) {
+        buf[base + i] ^= uint4(gid + i, gid + i + 1, gid + i + 2, gid + i + 3);
+    }
+}
+
 // decode one group's qpack byte arithmetically from (code, signbit)
 inline uchar stq_decode_arith(uint code, uint b) {
     uint z = code >> 2;          // zero lane
@@ -39,7 +60,7 @@ inline uchar stq_decode_arith(uint code, uint b) {
     return b ? (uchar)(0xAA - q) : (uchar)q;
 }
 
-// ---------------------------------------------------------------- v0: current ggml kernel
+// ---------------------------------------------------------------- v0: first working ggml kernel
 template<int NR0, int NSG>
 void mv_impl_v0(constant mvargs & args,
                 device const char * src0,
@@ -69,7 +90,7 @@ void mv_impl_v0(constant mvargs & args,
     for (int ib = ix; ib < nb; ib += 2) {
         for (short k = 0; k < 16; k++) yl[k] = yb[k];
 
-        for (short row = 0; row < NR0; row++) {
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const block_stq * bx = ax[row] + ib;
             const float d = bx->d;
             float sum = 0.f;
@@ -97,7 +118,7 @@ void mv_impl_v0(constant mvargs & args,
 // thread t16 of a 16-thread block-slice owns groups 4*t16 .. 4*t16+3 (16 weights):
 //   chunk = t16>>2, gloc = (t16&3)*4, lane-m weight at chunk*64 + gloc + m*16
 //   qs bytes 2*t16, 2*t16+1 ; sign byte t16>>1, bits (t16&1)*4 + j
-template<int NR0, int NSG, bool ARITH>
+template<int NR0, int NSG, int DECODE>
 void mv_impl_ga(constant mvargs & args,
                 device const char * src0,
                 device const float * y,
@@ -129,22 +150,27 @@ void mv_impl_ga(constant mvargs & args,
         const float4 yv2 = *(device const float4 *)(yb + 32);
         const float4 yv3 = *(device const float4 *)(yb + 48);
 
-        for (short row = 0; row < NR0; row++) {
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const block_stq * bx = ax[row] + ib;
             const ushort qp = *(device const ushort *)(bx->qs + 2*t16);
             const uchar  sb = bx->sign[t16 >> 1] >> sbsh;
             const float d = bx->d;
             float sum = 0.f;
-            for (short j = 0; j < 4; j++) {
+            FOR_UNROLL (short j = 0; j < 4; j++) {
                 const uint code = (qp >> (8*(j >> 1) + 4*(j & 1))) & 0xF;
                 const uint b    = (sb >> j) & 1;
-                const uint qpack = ARITH ? (uint)stq_decode_arith(code, b)
-                                         : (uint)stq_cb[(b << 4) | code];
-                const float l0 = (float)((int)(qpack        & 3) - 1);
-                const float l1 = (float)((int)((qpack >> 2) & 3) - 1);
-                const float l2 = (float)((int)((qpack >> 4) & 3) - 1);
-                const float l3 = (float)((int)((qpack >> 6) & 3) - 1);
-                sum += l0*yv0[j] + l1*yv1[j] + l2*yv2[j] + l3*yv3[j];
+                const float4 yy = float4(yv0[j], yv1[j], yv2[j], yv3[j]);
+                if (DECODE == 2) {
+                    sum += dot(float4(stq_cb4_full[(b << 4) | code]), yy);
+                } else {
+                    const uint qpack = DECODE == 1 ? (uint)stq_decode_arith(code, b)
+                                                   : (uint)stq_cb[(b << 4) | code];
+                    const float l0 = (float)((int)(qpack        & 3) - 1);
+                    const float l1 = (float)((int)((qpack >> 2) & 3) - 1);
+                    const float l2 = (float)((int)((qpack >> 4) & 3) - 1);
+                    const float l3 = (float)((int)((qpack >> 6) & 3) - 1);
+                    sum += l0*yv0[j] + l1*yv1[j] + l2*yv2[j] + l3*yv3[j];
+                }
             }
             sumf[row] += d * sum;
         }
@@ -163,7 +189,7 @@ void mv_impl_ga(constant mvargs & args,
 //   thread t8 owns groups 8*t8 .. 8*t8+7 (32 weights)
 //   qs: one uint32 at qs + 4*t8 ; sign: one byte at sign + t8
 //   y: 8 float4 loads per block per thread, shared across NR0 rows
-template<int NR0, int NSG>
+template<int NR0, int NSG, int DECODE = 0>
 void mv_impl_v4(constant mvargs & args,
                 device const char * src0,
                 device const float * y,
@@ -198,7 +224,7 @@ void mv_impl_v4(constant mvargs & args,
         const float4 yv3a = *(device const float4 *)(yb + 48);
         const float4 yv3b = *(device const float4 *)(yb + 52);
 
-        for (short row = 0; row < NR0; row++) {
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const block_stq * bx = ax[row] + ib;
             // 42-byte blocks: uint loads here would be misaligned for odd ib —
             // read two 2-byte-aligned ushorts and combine instead
@@ -208,10 +234,17 @@ void mv_impl_v4(constant mvargs & args,
             const uchar s8  = bx->sign[t8];
             const float d = bx->d;
             float sum = 0.f;
-            for (short j = 0; j < 8; j++) {
+            FOR_UNROLL (short j = 0; j < 8; j++) {
                 const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
                 const uint code  = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
                 const uint b     = (s8 >> j) & 1;
+                const float4 yy = j < 4
+                    ? float4(yv0a[j], yv1a[j], yv2a[j], yv3a[j])
+                    : float4(yv0b[j-4], yv1b[j-4], yv2b[j-4], yv3b[j-4]);
+                if (DECODE == 2) {
+                    sum += dot(float4(stq_cb4_full[(b << 4) | code]), yy);
+                    continue;
+                }
                 const uint qpack = stq_cb[(b << 4) | code];
                 const float l0 = (float)((int)(qpack        & 3) - 1);
                 const float l1 = (float)((int)((qpack >> 2) & 3) - 1);
@@ -241,27 +274,27 @@ kernel void kernel_mv_v0_8x2(constant mvargs & args, device const char * src0, d
 }
 kernel void kernel_mv_v2_8x2(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<8,2,false>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<8,2,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v3_8x2(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<8,2,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<8,2,1>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v2_4x4(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<4,4,false>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<4,4,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v3_4x4(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<4,4,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<4,4,1>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v2_16x1(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<16,1,false>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<16,1,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v3_16x1(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<16,1,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<16,1,1>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v4_4x2(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
@@ -289,17 +322,29 @@ kernel void kernel_mv_v4_4x8(constant mvargs & args, device const char * src0, d
 }
 kernel void kernel_mv_v2_4x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<4,8,false>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<4,8,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v2_8x4(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<8,4,false>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<8,4,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 kernel void kernel_mv_v2_2x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mv_impl_ga<2,8,false>(args, src0, y, dst, tgpig, tiisg, sgitg);
+    mv_impl_ga<2,8,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 
+kernel void kernel_mv_v2_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                              uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_ga<2,16,0>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v7_charfull_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                      uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_ga<2,16,2>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v8_fourblock_charfull_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                                 uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v4<2,16,2>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
 template<int NR0, int NSG>
 void mv_impl_v4b(constant mvargs & args,
                 device const char * src0,

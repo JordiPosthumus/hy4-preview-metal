@@ -19,7 +19,7 @@ full Metal support:
 
 | kernel | purpose |
 |---|---|
-| `kernel_mul_mv_stq1_0_f32` | decode (batch 1) — group-aligned mapping, 4 codebook gathers per 16 weights, float4 y loads shared across rows |
+| `kernel_mul_mv_stq1_0_f32` | decode (batch 1) — four blocks per SIMD group, vector-valued ternary lookup, group-aligned float4 loads |
 | `kernel_mul_mv_ext_stq1_0_f32_r1_2..5` | small batches (2–8) |
 | `kernel_mul_mm_stq1_0_f32/_f16` | prefill (batch ≥ 9) |
 | `kernel_mul_mm_id_stq1_0_f32/_f16` | MoE routed-expert matmuls (`mul_mat_id`) |
@@ -38,10 +38,25 @@ Decode-path matvec bandwidth (16384×16384, standalone A/B bench):
 | kernel | bandwidth |
 |---|---|
 | element-offset mapping (first working version) | 45–52 GB/s |
-| **group-aligned mapping (shipped here)** | **85–94 GB/s** |
+| group-aligned mapping (original 4×4 schedule) | 85–94 GB/s |
 | arithmetic codebook decode (tried, rejected) | 58–64 GB/s |
 | llama.cpp's own q1_0 ternary kernel (family ceiling reference) | 119 GB/s |
 | Q8_0 (mature integer kernel) | 396 GB/s |
+
+The model's STQ1_0 tensors are all 6144×2048×256 expert stacks. At the exact
+6144×2048 per-expert shape, the first scheduling pass moved 4×4 to 2×8 (median
+61 vs 55 GB/s across seven pairs, +10.9%). A second cold-cache sweep then combined
+2×16 scheduling with a vector-valued `char4` codebook: across six alternating-order
+pairs it beat 2×8 every time, with a median **+7.8%** pairwise gain. The final cleaned
+harness measured **95 vs 88 GB/s**, while max absolute error improved slightly from
+1.60e-5 to 1.46e-5. A third pass kept that 2×16 schedule and compact codebook but
+changed from 16 to 8 lanes per block, letting each SIMD group advance four blocks
+per iteration. With production-style forced unrolling it beat the prior two-block
+kernel in all six alternating-order cold-cache pairs, with a median **+12.7%**
+pairwise gain. The tiny float reduction-order change measured 1.84e-5 max absolute
+error, and the rebuilt ggml library still passed BS=1/8/32 at 0.0000/0.0001/0.0232.
+The sweep used a 2.1 MB synthetic matrix and an optional bounded 128 MB cache-thrash
+buffer; the 229 GB model was not loaded, so end-to-end impact remains unmeasured.
 
 Prefill: the shipped path uses llama.cpp's generic `mul_mm` template instantiated with the
 STQ1_0 dequant. A dedicated prefill kernel measured in the standalone harness reached
@@ -100,7 +115,10 @@ build-metal/bin/llama-server -m Hy4-preview-STQ1_0.gguf -a Hy4-preview-STQ1_0 \
   `g = (w/64)*16 + (w%16)` at lane `p = (w%64)/16`. The 32-entry codebook's sign=1
   half is exactly the negation of the sign=0 half (`q' = 0xAA - q` per byte), but an
   arithmetic decode is *slower* than the constant-cache gather on Apple GPU.
-- **Threadgroup shape matters**: NR0=4/NSG=4 beat 8×2 and 16×1 by ~30%.
+- **Threadgroup shape depends on matrix dimensions**: at 16384×16384,
+  NR0=4/NSG=4 beat 8×2 and 16×1 by ~30%; at Hy4's 6144×2048 expert shape,
+  NR0=2/NSG=16 with the vector codebook and four-block SIMD mapping wins instead
+  (see Results).
 - **Test-data hygiene**: random bytes reinterpreted as fp16 are ~3% inf/nan — use
   finite scales when building synthetic validation data, or your error metric lies.
 - At load time llama.cpp reports `Lightning Indexer not supported, set to disabled`

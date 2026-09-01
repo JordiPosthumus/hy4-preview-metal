@@ -1,24 +1,27 @@
 From b743b94bc584fda28a209753ce7d6d17887a9972 Mon Sep 17 00:00:00 2001
 From: JordiPosthumus <jordiposthumus@users.noreply.github.com>
 Date: Mon, 31 Aug 2026 00:49:20 -0300
-Subject: [PATCH] STQ1_0 mul_mv: group-aligned mapping, 45 -> 94 GB/s (2.08x)
+Subject: [PATCH] STQ1_0 mul_mv: four-block mapping and production-shape tuning
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-- thread t16 owns groups 4*t16..4*t16+3; 4 table gathers per 16 weights
-  instead of 16; float4 y loads shared across nr0 rows
-- tile N_R0=4/N_SG=4 (validated best in standalone sweep)
-- ushort qs loads (2-byte aligned; 42B block stride makes uint loads
-  misaligned for odd ib — the bug found via standalone bench v4)
-- correctness re-validated on all 3 batch paths after port
+- replace the element-offset decoder with group-aligned float4 loads and a
+  compact vector-valued ternary codebook
+- use 8 lanes per block so each SIMD group advances four blocks at once,
+  with eight char4 dot products per lane
+- tune the Hy4 6144x2048 expert shape to N_R0=2/N_SG=16
+- forced-unroll A/B: four-block mapping won all six alternating-order
+  cold-cache pairs against the prior two-block kernel, median +12.7%
+- preserve 2-byte-aligned ushort qs loads for the 42-byte block stride
+- correctness re-validated on Metal BS=1/8/32 after the production build
 ---
  ggml/src/ggml-metal/ggml-metal-impl.h |  4 +--
- ggml/src/ggml-metal/ggml-metal.metal  | 49 ++++++++++++++-------------
- 2 files changed, 28 insertions(+), 25 deletions(-)
+ ggml/src/ggml-metal/ggml-metal.metal  | 67 ++++++++++++++++++++++-------------
+ 2 files changed, 45 insertions(+), 26 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
-index da2ec92..df527f2 100644
+index da2ec92..c30cb0b 100644
 --- a/ggml/src/ggml-metal/ggml-metal-impl.h
 +++ b/ggml/src/ggml-metal/ggml-metal-impl.h
 @@ -24,8 +24,8 @@
@@ -27,16 +30,34 @@ index da2ec92..df527f2 100644
  
 -#define N_R0_STQ1_0 8
 -#define N_SG_STQ1_0 2
-+#define N_R0_STQ1_0 4
-+#define N_SG_STQ1_0 4
++#define N_R0_STQ1_0 2
++#define N_SG_STQ1_0 16
  
  #define N_R0_Q2_0 8
  #define N_SG_Q2_0 2
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index 7354377..84f82d6 100644
+index 7354377..33fc74d 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
-@@ -3775,43 +3775,46 @@ void kernel_mul_mv_stq1_0_f32_impl(
+@@ -173,6 +173,17 @@ void dequantize_q1_0_t4(device const block_q1_0 * xb, short il, thread type4 & r
+ // STQ1_0: 256 weights per super-block, groups of 4 weights indexed by a 4-bit code plus a
+ // 1-bit table select into a 32-entry codebook of 3:4-sparse ternary patterns, one fp16 scale.
+ // Weight w in a block belongs to group g = (w/64)*16 + (w%16) at lane p = (w%64)/16.
++constant char4 stq1_0_codebook_vec[32] = {
++    char4( 0,  1,  1,  1), char4( 0,  1, -1,  1), char4( 0,  1,  1, -1), char4( 0,  1, -1, -1),
++    char4( 1,  0,  1,  1), char4( 1,  0, -1,  1), char4( 1,  0,  1, -1), char4( 1,  0, -1, -1),
++    char4( 1,  1,  0,  1), char4( 1, -1,  0,  1), char4( 1,  1,  0, -1), char4( 1, -1,  0, -1),
++    char4( 1,  1,  1,  0), char4( 1, -1,  1,  0), char4( 1,  1, -1,  0), char4( 1, -1, -1,  0),
++    char4( 0, -1, -1, -1), char4( 0, -1,  1, -1), char4( 0, -1, -1,  1), char4( 0, -1,  1,  1),
++    char4(-1,  0, -1, -1), char4(-1,  0,  1, -1), char4(-1,  0, -1,  1), char4(-1,  0,  1,  1),
++    char4(-1, -1,  0, -1), char4(-1,  1,  0, -1), char4(-1, -1,  0,  1), char4(-1,  1,  0,  1),
++    char4(-1, -1, -1,  0), char4(-1,  1, -1,  0), char4(-1, -1,  1,  0), char4(-1,  1,  1,  0),
++};
++
+ template <typename type4x4>
+ void dequantize_stq1_0(device const block_stq1_0 * xb, short il, thread type4x4 & reg) {
+     // il in 0..15 selects the 16-weight chunk [il*16, il*16+16)
+@@ -3775,43 +3786,51 @@ void kernel_mul_mv_stq1_0_f32_impl(
          ax[row] = (device const block_stq1_0 *) ((device char *) src0 + offset0);
      }
  
@@ -51,33 +72,39 @@ index 7354377..84f82d6 100644
 -    // fixed per thread: lane p and 64-weight chunk of the group mapping
 -    const short p     = (il & 63) >> 4;
 -    const short chunk = il >> 6;
--
--    device const float * yb = y + ix*QK_K + il;
-+    // group-aligned mapping (validated +63% vs element-offset mapping in bench/kernels.metal):
-+    // 16 threads per block-slice, thread t16 owns groups 4*t16..4*t16+3 (16 weights):
-+    //   chunk = t16>>2, gloc = (t16&3)*4, lane-m weight at chunk*64 + gloc + m*16
-+    //   qs bytes 2*t16, 2*t16+1 (2-byte aligned: 42-byte block stride is even); sign byte t16>>1
-+    const short ix  = (tiisg/16);
-+    const short t16 = (tiisg%16);
-+    const int chunk = t16 >> 2;
-+    const int gloc  = (t16 & 3) << 2;
-+    const int sbsh  = (t16 & 1) << 2;
++    // Four blocks in flight per SIMD group. Each 8-lane block slice owns eight
++    // consecutive groups (32 weights), keeping the loads group-aligned while
++    // halving the number of block iterations relative to the 16-lane mapping.
++    const short ix  = (tiisg/8);
++    const short t8  = (tiisg%8);
++    const int chunk = t8 >> 1;
++    const int gbase = (t8 & 1) << 3;
  
-     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/16) {
+-    device const float * yb = y + ix*QK_K + il;
+-
+-    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/16) {
 -        FOR_UNROLL (short k = 0; k < 16; k++) {
 -            yl[k] = yb[k];
 -        }
-+        // y float4s for this block iteration, shared across all nr0 rows
-+        device const float * yb = y + ib*QK_K + chunk*64 + gloc;
-+        const float4 yv0 = *(device const float4 *)(yb);
-+        const float4 yv1 = *(device const float4 *)(yb + 16);
-+        const float4 yv2 = *(device const float4 *)(yb + 32);
-+        const float4 yv3 = *(device const float4 *)(yb + 48);
++    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
++        // Eight y float4s per block iteration, shared across all nr0 rows.
++        device const float * yb = y + ib*QK_K + chunk*64 + gbase;
++        const float4 yv0a = *(device const float4 *)(yb);
++        const float4 yv0b = *(device const float4 *)(yb + 4);
++        const float4 yv1a = *(device const float4 *)(yb + 16);
++        const float4 yv1b = *(device const float4 *)(yb + 20);
++        const float4 yv2a = *(device const float4 *)(yb + 32);
++        const float4 yv2b = *(device const float4 *)(yb + 36);
++        const float4 yv3a = *(device const float4 *)(yb + 48);
++        const float4 yv3b = *(device const float4 *)(yb + 52);
  
          FOR_UNROLL (short row = 0; row < nr0; row++) {
              device const block_stq1_0 * bx = ax[row] + ib;
-+            const ushort qp = *(device const ushort *)(bx->qs + 2*t16);
-+            const uchar  sb = bx->sign[t16 >> 1] >> sbsh;
++            // block_stq1_0 is 42 bytes, so odd blocks are only 2-byte aligned.
++            const ushort qlo = *(device const ushort *)(bx->qs + 4*t8);
++            const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
++            const uint q32 = (uint)qlo | ((uint)qhi << 16);
++            const uchar sb = bx->sign[t8];
              const float d = bx->d;
  
              float sum = 0.f;
@@ -88,15 +115,15 @@ index 7354377..84f82d6 100644
 -                const uint8_t sb   = (bx->sign[g >> 3] >> (g & 7)) & 0x01;
 -                const uint8_t qpack = stq1_0_codebook[((uint32_t) sb << 4) | code];
 -                sum += (float) (((qpack >> (2*p)) & 3) - 1) * yl[k];
-+            FOR_UNROLL (short j = 0; j < 4; j++) {
-+                const uint code = (qp >> (8*(j >> 1) + 4*(j & 1))) & 0xF;
++            FOR_UNROLL (short j = 0; j < 8; j++) {
++                const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
++                const uint code = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
 +                const uint b    = (sb >> j) & 1;
-+                const uint qpack = stq1_0_codebook[(b << 4) | code];
-+                const float l0 = (float)((int)(qpack         & 3) - 1);
-+                const float l1 = (float)((int)((qpack >> 2) & 3) - 1);
-+                const float l2 = (float)((int)((qpack >> 4) & 3) - 1);
-+                const float l3 = (float)((int)((qpack >> 6) & 3) - 1);
-+                sum += l0*yv0[j] + l1*yv1[j] + l2*yv2[j] + l3*yv3[j];
++                const float4 lv = float4(stq1_0_codebook_vec[(b << 4) | code]);
++                const float4 yy = j < 4
++                    ? float4(yv0a[j], yv1a[j], yv2a[j], yv3a[j])
++                    : float4(yv0b[j-4], yv1b[j-4], yv2b[j-4], yv3b[j-4]);
++                sum += dot(lv, yy);
              }
  
              sumf[row] += d * sum;
@@ -108,4 +135,3 @@ index 7354377..84f82d6 100644
      device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 -- 
 2.54.0
-

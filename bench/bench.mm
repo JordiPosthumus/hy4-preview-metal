@@ -52,7 +52,30 @@ static bool run_and_wait(id<MTLCommandQueue> q, id<MTLComputePipelineState> ps,
         if (dt > timeout_s) { printf("[TIMEOUT after %.1fs]\n", dt); fflush(stdout); return false; }
         usleep(200);
     }
-    if (out_sec) *out_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (out_sec) {
+        const double gpu_sec = cb.GPUEndTime - cb.GPUStartTime;
+        const double wall_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        *out_sec = gpu_sec > 0.0 ? gpu_sec : wall_sec;
+    }
+    return cb.status == MTLCommandBufferStatusCompleted && !cb.error;
+}
+
+static bool thrash_and_wait(id<MTLCommandQueue> q, id<MTLComputePipelineState> ps,
+                            id<MTLBuffer> buf, double timeout_s) {
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:buf offset:0 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(2048, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+
+    auto t0 = std::chrono::steady_clock::now();
+    while (cb.status < MTLCommandBufferStatusCompleted) {
+        if (cb.status == MTLCommandBufferStatusError) return false;
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout_s) return false;
+        usleep(200);
+    }
     return cb.status == MTLCommandBufferStatusCompleted && !cb.error;
 }
 
@@ -63,6 +86,8 @@ int main(int argc, char ** argv) {
         const int blocks_per_row = ne00 / 256;
         const size_t row_bytes = 42 * blocks_per_row;
         const int iters = argc > 3 ? atoi(argv[3]) : 20;
+        const char * filter = argc > 4 ? argv[4] : nullptr;
+        const bool cold_cache = getenv("COLD_CACHE") != nullptr;
 
         CHECKPOINT("device");
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -126,13 +151,41 @@ int main(int argc, char ** argv) {
         const char * variants[] = { "kernel_mv_v0_8x2", "kernel_mv_v2_4x4", "kernel_mv_v3_4x4",
                                     "kernel_mv_v4_4x2", "kernel_mv_v4_8x2", "kernel_mv_v4_4x4", "kernel_mv_v4_8x4",
                                     "kernel_mv_v4_2x8", "kernel_mv_v4_4x8",
-                                    "kernel_mv_v2_4x8", "kernel_mv_v2_8x4", "kernel_mv_v2_2x8", "kernel_mv_v4b_2x8" };
-        const int nsgs[] = { 2, 4, 4, 2, 2, 4, 4, 8, 8, 8, 4, 8, 8 };
-        const int nr0s[] = { 8, 4, 4, 4, 8, 4, 8, 2, 4, 4, 8, 2, 2 };
+                                    "kernel_mv_v2_4x8", "kernel_mv_v2_8x4", "kernel_mv_v2_2x8", "kernel_mv_v4b_2x8",
+                                    "kernel_mv_v2_2x16", "kernel_mv_v7_charfull_2x16",
+                                    "kernel_mv_v8_fourblock_charfull_2x16" };
+        const int nsgs[] = { 2, 4, 4, 2, 2, 4, 4, 8, 8, 8, 4, 8, 8, 16, 16, 16 };
+        const int nr0s[] = { 8, 4, 4, 4, 8, 4, 8, 2, 4, 4, 8, 2, 2, 2, 2, 2 };
 
         id<MTLCommandQueue> q = [dev newCommandQueue];
+        id<MTLComputePipelineState> thrash_ps = nil;
+        id<MTLBuffer> thrash_buf = nil;
+        if (cold_cache) {
+            id<MTLFunction> thrash_fn = [lib newFunctionWithName:@"kernel_cache_thrash"];
+            thrash_ps = [dev newComputePipelineStateWithFunction:thrash_fn error:&err];
+            thrash_buf = [dev newBufferWithLength:128ull*1024*1024 options:MTLResourceStorageModeShared];
+            printf("[mode] cold-cache: 128 MB cache-thrash buffer\n");
+        }
 
-        for (int v = 0; v < 13; ++v) {
+        // Stabilize GPU clocks/residency before collecting per-variant timestamps.
+        // Without this, the first one or two small-matrix variants can include a
+        // 0.2-0.4 ms ramp-up penalty even after their local three-dispatch warmup.
+        if (ne01 % 16 == 0) {
+            id<MTLFunction> warm_fn = [lib newFunctionWithName:@"kernel_mv_v2_2x8"];
+            id<MTLComputePipelineState> warm_ps = [dev newComputePipelineStateWithFunction:warm_fn error:&err];
+            double warm_sec = 0;
+            for (int i = 0; i < 64; ++i) {
+                if (!run_and_wait(q, warm_ps, abuf, wbuf, ybuf, dbuf, ne01/16, 32*8, 15.0, &warm_sec)) {
+                    printf("hardware warmup failed\n");
+                    return 1;
+                }
+            }
+        }
+
+        const bool reverse = getenv("BENCH_REVERSE") != nullptr;
+        for (int step = 0; step < 16; ++step) {
+            const int v = reverse ? 15 - step : step;
+            if (filter && !strstr(filter, variants[v])) continue;
             printf("[variant] %s\n", variants[v]); fflush(stdout);
             id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:variants[v]]];
             if (!fn) { printf("  MISSING\n"); continue; }
@@ -155,10 +208,13 @@ int main(int argc, char ** argv) {
                 printf("  dbg out[0..3]: %.4f %.4f %.4f %.4f\n", out[0], out[1], out[2], out[3]);
                 printf("  dbg ref[0..3]: %.4f %.4f %.4f %.4f\n", ref[0], ref[1], ref[2], ref[3]);
             }
+            double max_abs = 0;
             double max_rel = 0;
             for (int r = 0; r < ne01; ++r) {
-                double e = fabs(out[r] - ref[r]) / (fabs(ref[r]) + 1e-9);
-                if (e > max_rel) max_rel = e;
+                const double ae = fabs(out[r] - ref[r]);
+                const double re = ae / (fabs(ref[r]) + 1e-9);
+                if (ae > max_abs) max_abs = ae;
+                if (re > max_rel) max_rel = re;
             }
 
             // timing
@@ -166,14 +222,16 @@ int main(int argc, char ** argv) {
             bool ok = true;
             for (int i = 0; i < 3; ++i) ok &= run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, 15.0, &sec);
             for (int i = 0; i < iters && ok; ++i) {
+                if (cold_cache) ok = thrash_and_wait(q, thrash_ps, thrash_buf, 15.0);
+                if (!ok) break;
                 ok = run_and_wait(q, ps, abuf, wbuf, ybuf, dbuf, grid_x, 32*NSG, 15.0, &sec);
                 tot += sec;
             }
             if (!ok) { printf("  FAILED/TIMEOUT in timing\n"); continue; }
 
             double bytes = (double)w.size() * iters;
-            printf("  max_rel_err=%.2e   %6.2f ms/iter   BW=%4.0f GB/s\n",
-                   max_rel, tot/iters*1e3, bytes/tot/1e9);
+            printf("  max_abs_err=%.2e  max_rel_err=%.2e   %6.3f ms/iter   BW=%4.0f GB/s\n",
+                   max_abs, max_rel, tot/iters*1e3, bytes/tot/1e9);
             fflush(stdout);
         }
         CHECKPOINT("done");
