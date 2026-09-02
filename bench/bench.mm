@@ -12,6 +12,7 @@
 #include <vector>
 #include <random>
 #include <chrono>
+#include <algorithm>
 
 static const unsigned char stq_cb[32] = {
     0xA9,0x89,0x29,0x09,0xA6,0x86,0x26,0x06,
@@ -193,10 +194,10 @@ int main(int argc, char ** argv) {
 
         const bool reverse = getenv("BENCH_REVERSE") != nullptr;
 
-        // Paired A/B mode: PAIR="a_substr:b_substr" alternates the two matching
-        // variants per iteration and prints a per-rep table. Interleaving in one
-        // process cancels slow GPU-clock drift from the shared machine, which is
-        // the dominant noise source (the notes call it +/-20%).
+        // Paired A/B mode: PAIR="a_substr:b_substr" runs an exactly balanced,
+        // deterministically shuffled mix of A->B and B->A pairs. Same-process
+        // interleaving cancels slow GPU-clock drift, while reporting each order
+        // separately catches order-dependent false wins on a contended GPU.
         const char * pair = getenv("PAIR");
         int pv[2] = {-1, -1};
         if (pair) {
@@ -224,27 +225,72 @@ int main(int argc, char ** argv) {
             const int gx0 = ne01 / tg_rows0, gx1 = ne01 / tg_rows1;
             const size_t tm0 = tmemf[pv[0]] ? (size_t)ne00*sizeof(float) : 0;
             const size_t tm1 = tmemf[pv[1]] ? (size_t)ne00*sizeof(float) : 0;
-            // correctness of A
-            run_and_wait(q, pps[0], abuf, wbuf, ybuf, dbuf, gx0, 32*nsgs[pv[0]], tm0, 15.0, &psec[0]);
-            float * out = (float *)dbuf.contents;
-            double ma = 0, mr = 0;
-            for (int r = 0; r < ne01; ++r) { double ae=fabs(out[r]-ref[r]); double re=ae/(fabs(ref[r])+1e-9); if(ae>ma)ma=ae; if(re>mr)mr=re; }
-            printf("[PAIR] A=%s B=%s @ %dx%d  A_err=(%.2e,%.2e) iters=%d\n", variants[pv[0]], variants[pv[1]], ne00, ne01, ma, mr, iters);
-            // warm both
-            for (int i = 0; i < 4; ++i) {
-                run_and_wait(q, pps[0], abuf, wbuf, ybuf, dbuf, gx0, 32*nsgs[pv[0]], tm0, 15.0, &psec[0]);
-                run_and_wait(q, pps[1], abuf, wbuf, ybuf, dbuf, gx1, 32*nsgs[pv[1]], tm1, 15.0, &psec[1]);
+            // correctness of both variants
+            double max_abs[2] = {0, 0}, max_rel[2] = {0, 0};
+            for (int k = 0; k < 2; ++k) {
+                const int gx = k == 0 ? gx0 : gx1;
+                const size_t tm = k == 0 ? tm0 : tm1;
+                run_and_wait(q, pps[k], abuf, wbuf, ybuf, dbuf, gx, 32*nsgs[pv[k]], tm, 15.0, &psec[k]);
+                float * out = (float *)dbuf.contents;
+                for (int r = 0; r < ne01; ++r) {
+                    const double ae = fabs(out[r]-ref[r]);
+                    const double re = ae/(fabs(ref[r])+1e-9);
+                    if (ae > max_abs[k]) max_abs[k] = ae;
+                    if (re > max_rel[k]) max_rel[k] = re;
+                }
             }
-            double ta = 0, tb = 0; int na = 0, nb = 0; double ba = 0, bb = 0;
+            const int pair_iters = iters & ~1;
+            if (pair_iters != iters) printf("[PAIR] rounding odd iters=%d down to %d for exact order balance\n", iters, pair_iters);
+            if (pair_iters < 2) { printf("[PAIR] need at least two iterations\n"); return 1; }
+            printf("[PAIR] A=%s B=%s @ %dx%d  err_A=(%.2e,%.2e) err_B=(%.2e,%.2e) pairs=%d\n",
+                   variants[pv[0]], variants[pv[1]], ne00, ne01,
+                   max_abs[0], max_rel[0], max_abs[1], max_rel[1], pair_iters);
+
+            // symmetric ABBA warmup
+            for (int i = 0; i < 8; ++i) {
+                const int k = (i & 3) == 2 || (i & 3) == 3 ? 1 : 0;
+                const int gx = k == 0 ? gx0 : gx1;
+                const size_t tm = k == 0 ? tm0 : tm1;
+                run_and_wait(q, pps[k], abuf, wbuf, ybuf, dbuf, gx, 32*nsgs[pv[k]], tm, 15.0, &psec[k]);
+            }
+
+            std::vector<int> orders(pair_iters);
+            for (int i = 0; i < pair_iters; ++i) orders[i] = i >= pair_iters/2;
+            std::mt19937 order_rng(0x485934u);
+            std::shuffle(orders.begin(), orders.end(), order_rng);
+
+            std::vector<double> ratios, ratios_ab, ratios_ba;
+            double ta = 0, tb = 0; int na = 0, nb = 0, wins_a = 0;
             const double wbytes = (double)w.size();
-            for (int rep = 0; rep < iters; ++rep) {
-                double sa = 0, sb = 0;
-                if (run_and_wait(q, pps[0], abuf, wbuf, ybuf, dbuf, gx0, 32*nsgs[pv[0]], tm0, 15.0, &sa)) { ta += sa; na++; }
-                if (run_and_wait(q, pps[1], abuf, wbuf, ybuf, dbuf, gx1, 32*nsgs[pv[1]], tm1, 15.0, &sb)) { tb += sb; nb++; }
+            for (int rep = 0; rep < pair_iters; ++rep) {
+                double sec[2] = {0, 0};
+                bool ok_pair = true;
+                for (int pos = 0; pos < 2; ++pos) {
+                    const int k = pos == 0 ? orders[rep] : 1-orders[rep];
+                    const int gx = k == 0 ? gx0 : gx1;
+                    const size_t tm = k == 0 ? tm0 : tm1;
+                    if (cold_cache) ok_pair &= thrash_and_wait(q, thrash_ps, thrash_buf, 15.0);
+                    ok_pair &= run_and_wait(q, pps[k], abuf, wbuf, ybuf, dbuf, gx, 32*nsgs[pv[k]], tm, 15.0, &sec[k]);
+                }
+                if (!ok_pair) continue;
+                ta += sec[0]; tb += sec[1]; na++; nb++;
+                const double ratio = sec[1]/sec[0]; // >1 means A is faster
+                ratios.push_back(ratio);
+                (orders[rep] == 0 ? ratios_ab : ratios_ba).push_back(ratio);
+                wins_a += sec[0] < sec[1];
             }
-            ba = wbytes*na/ta/1e9; bb = wbytes*nb/tb/1e9;
+            auto median = [](std::vector<double> v) {
+                if (v.empty()) return 0.0;
+                std::sort(v.begin(), v.end());
+                const size_t n = v.size();
+                return n & 1 ? v[n/2] : 0.5*(v[n/2-1] + v[n/2]);
+            };
+            const double ba = wbytes*na/ta/1e9;
+            const double bb = wbytes*nb/tb/1e9;
             printf("[PAIR] A %-34s %6.3f ms  %4.0f GB/s (n=%d)\n", variants[pv[0]], ta/na*1e3, ba, na);
             printf("[PAIR] B %-34s %6.3f ms  %4.0f GB/s (n=%d)   A/B ratio %.3f\n", variants[pv[1]], tb/nb*1e3, bb, nb, ba/bb);
+            printf("[PAIR] paired B/A median %.4f  AB %.4f  BA %.4f  A_wins=%d/%zu\n",
+                   median(ratios), median(ratios_ab), median(ratios_ba), wins_a, ratios.size());
             CHECKPOINT("done");
             return 0;
         }
