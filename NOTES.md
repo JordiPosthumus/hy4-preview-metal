@@ -134,10 +134,13 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
   STQ1_0 matvec with four independent component FMA chains and a balanced final
   reduction. The group-aligned mapping, compact `char4` codebook, load count,
   2-row/16-SIMD-group dispatch, and every runtime setting remain unchanged.
-- On the exact 6144x2048 expert shape, the raw-Metal GPU-timestamp harness won
-  all eight alternating-order pairs. Average kernel time was 0.02625 ms versus
-  0.03225 ms (-18.6%); average effective bandwidth was 78.9 versus 64.4 GB/s
-  (+22.5%). Max absolute error improved from 1.84e-05 to 1.51e-05.
+- A later harness audit found two stale trailing geometry entries had shifted the
+  launch metadata for appended v18/v19 variants. The earlier -18.6%/+22.5%
+  figures are invalid and withdrawn. After aligning every kernel name to its
+  actual NR0/NSG template and adding static array-size assertions, v19 remains a
+  reproducible win at 6144x2048: paired B/A time median 0.9557 (about 4.4%
+  faster), AB=0.9779, BA=0.9188, with 15/20 v19 wins. Corrected max-absolute
+  errors are 1.69e-05 for v19 and 1.84e-05 for v18.
 - The rebuilt ggml library still passes BS=1/8/32 at
   0.0000/0.0001/0.0232 maximum absolute error. The final synthetic decode
   process used 47,824,896 bytes maximum RSS; no model was loaded.
@@ -147,6 +150,35 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
   a phased 6 KiB routed-output slab; explicit packed-q pairing; 4-row decode;
   and a native `float4` codebook. These were neutral, noisy, unsupported, or
   materially slower (several by roughly 2x).
+
+## Small-batch and routed follow-up (2026-09-01 autoresearch, third pass)
+- The exact 6144x2048 STQ1_0 small-batch path now uses NSG=1/NXPSG=4 only at
+  batches 4, 5, 7, and 8. Randomized same-process candidate/baseline paired time
+  medians were 0.9594, 0.9254, 0.9602, and 0.9407 (about 4.1%, 7.5%, 4.0%, and
+  5.9% faster), with 18/20, 20/20, 19/20, and 19/20 wins. AB and BA splits agreed.
+- Batches 2, 3, and 6 retain the original scheduler. Batch 3 was flat/slower; a
+  40-pair batch-6 retest reduced the apparent gain to a 0.3-0.5% median effect.
+  The maximum baseline/candidate output delta across the accepted cases was
+  8.392e-05. Final BS1/BS8/BS32 validation remains 0.0000/0.0001/0.0232.
+- The routed harness now aliases 256 logical experts over one physical 2.1 MB
+  weight matrix and supports uniform, clustered, and maximally spread route
+  patterns. This exercises the real ne02=256/ne20=8 map and empty-expert grid
+  without allocating the 256-expert stack.
+- Route distribution changes the matvec/matmul crossover dramatically: at 32
+  tokens spread traffic favored matvec, while traffic clustered onto eight
+  experts strongly favored matmul. A single higher/lower token threshold is not
+  safe without occupancy information.
+- Rejected and not shipped: group-aligned small-batch decode (13-23% slower),
+  scale broadcast (~6.2% slower), zero-lane-predicated three-FMA decode (~1.9%
+  slower), compile-time K=6144 specialization (~38% slower), a two-dispatch
+  sparse/dense routed hybrid (up to 2.1x slower at larger uniform batches), and
+  atomic route-map scatter (route-pattern and order dependent, with clustered
+  regressions). All production-side probes were removed after testing.
+- Contention is handled with symmetric warmups, deterministic balanced AB/BA
+  order, same-process shared resources, GPU timestamps where available, and
+  separate order-split ratios. Sign-flipping or load-dependent results do not ship.
+- All work used bounded exact-shape synthetic allocations; the full model was not
+  opened, mapped, or loaded.
 
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).

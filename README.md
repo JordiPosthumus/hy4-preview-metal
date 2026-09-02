@@ -60,10 +60,20 @@ buffer; the 229 GB model was not loaded, so end-to-end impact remains unmeasured
 
 A second decode pass changed only the reduction schedule: the four ternary
 components now accumulate in independent FMA chains before a balanced final sum.
-At the exact 6144x2048 expert shape it won all eight alternating-order GPU-timestamp
-pairs, cutting average kernel time from 0.03225 to 0.02625 ms (-18.6%) and raising
-average effective bandwidth from 64.4 to 78.9 GB/s (+22.5%). Max absolute error
-improved from 1.84e-05 to 1.51e-05. The full model was not loaded for this work.
+A later benchmark audit found two stale trailing entries had shifted the dispatch
+metadata for newly appended v18/v19 variants, so the earlier 18.6%/22.5% claims are
+withdrawn. With every variant name statically matched to its real NR0/NSG geometry,
+the component-wise kernel still wins: at 6144x2048 its paired GPU-time median is
+**4.4% lower** than the prior hoisted-dot kernel (AB 2.2%, BA 8.1%; 15/20 wins),
+with max absolute errors of 1.69e-5 and 1.84e-5 respectively.
+
+Small-batch scheduling is now specialized only for Hy4's exact 6144x2048 STQ1_0
+experts. Batches 4, 5, 7, and 8 use one SIMD group and a four-lane row reduction;
+batches 2, 3, and 6 retain the prior geometry. Randomized same-process comparisons
+measured candidate/baseline paired time medians of 0.9594, 0.9254, 0.9602, and
+0.9407 respectively (about **4.1%, 7.5%, 4.0%, and 5.9% faster**), with 18/20,
+20/20, 19/20, and 19/20 wins. The largest baseline/candidate output difference was
+8.392e-5. Exact-shape synthetic tensors were used; the full model was not loaded.
 
 Prefill: the legacy Metal `mul_mm` and routed `mul_mm_id` paths now use a cooperative
 STQ1_0 loader. Two threads per A row split the ternary groups and keep adjacent p lanes,
@@ -135,7 +145,11 @@ build-metal/bin/llama-server -m Hy4-preview-STQ1_0.gguf -a Hy4-preview-STQ1_0 \
   — the DSA sparse-attention indexer has no Metal implementation in the AngelSlim
   patch, so attention runs unsparsified. Quality is unaffected in casual use; long
   context is slower than the architecture intends.
-- Benchmarks while other GPU work is running are noisy (±20%).
+- **Contention discipline**: same-process candidates share the Metal queue,
+  buffers, and library; warmups are symmetric; AB and BA orders are exactly
+  balanced and deterministically shuffled; timings use completed command-buffer
+  GPU timestamps. Aggregate and order-split paired ratios are reported, and any
+  candidate whose sign changes with order or background load is rejected.
 
 ## Repo layout
 
