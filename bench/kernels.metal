@@ -622,6 +622,126 @@ kernel void kernel_mv_v23_exact_k6144_2x16(constant mvargs & args, device const 
     mv_impl_v19<2,16,false,false,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 
+// ---- v24/v25: exploit STQ's exact 3:4 structure directly. The low two code
+// bits select which two of the three non-zero lanes are negative, while the
+// high two bits select the zero lane; the separate sign bit negates the whole
+// pattern. Unlike v20, these forms never materialize four decoded weights.
+inline float stq_dot3_indexed(uint code, uint b, float4 yv) {
+    const uint zero_lane = code >> 2;
+    const uint flip0_lane = zero_lane < 2 ? 2 : 1;
+    const uint flip1_lane = zero_lane == 3 ? 2 : 3;
+    float v = ((yv.x + yv.y) + (yv.z + yv.w)) - yv[zero_lane];
+    v -= select(0.0f, 2.0f*yv[flip0_lane], bool(code & 1));
+    v -= select(0.0f, 2.0f*yv[flip1_lane], bool(code & 2));
+    return select(v, -v, bool(b));
+}
+
+inline float stq_dot3_switch(uint code, uint b, float4 yv) {
+    const float sy1 = select(yv.y, -yv.y, bool(code & 1));
+    const float sy2_bit0 = select(yv.z, -yv.z, bool(code & 1));
+    const float sy2_bit1 = select(yv.z, -yv.z, bool(code & 2));
+    const float sy3 = select(yv.w, -yv.w, bool(code & 2));
+    float v;
+    switch (code >> 2) {
+        case 0:  v = (yv.y + sy2_bit0) + sy3; break;
+        case 1:  v = (yv.x + sy2_bit0) + sy3; break;
+        case 2:  v = (yv.x + sy1) + sy3; break;
+        default: v = (yv.x + sy1) + sy2_bit1; break;
+    }
+    return select(v, -v, bool(b));
+}
+
+template<int NR0, int NSG, bool SWITCH_FORM, int NACC = 4>
+void mv_impl_dot3(constant mvargs & args,
+                  device const char * src0,
+                  device const float * y,
+                  device float * dst,
+                  uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int nb = args.ne00 / 256;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    device const block_stq * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_stq *)(src0 + (first_row + row) * args.nb01);
+    }
+
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / 8;
+    const short t8 = tiisg % 8;
+    const int chunk = t8 >> 1;
+    const int gbase = (t8 & 1) << 3;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        device const float * yb = y + r1*args.ne00 + ib*256 + chunk*64 + gbase;
+        const float4 yv0a = *(device const float4 *)(yb);
+        const float4 yv0b = *(device const float4 *)(yb + 4);
+        const float4 yv1a = *(device const float4 *)(yb + 16);
+        const float4 yv1b = *(device const float4 *)(yb + 20);
+        const float4 yv2a = *(device const float4 *)(yb + 32);
+        const float4 yv2b = *(device const float4 *)(yb + 36);
+        const float4 yv3a = *(device const float4 *)(yb + 48);
+        const float4 yv3b = *(device const float4 *)(yb + 52);
+        const float4 ycol[8] = {
+            float4(yv0a.x, yv1a.x, yv2a.x, yv3a.x), float4(yv0a.y, yv1a.y, yv2a.y, yv3a.y),
+            float4(yv0a.z, yv1a.z, yv2a.z, yv3a.z), float4(yv0a.w, yv1a.w, yv2a.w, yv3a.w),
+            float4(yv0b.x, yv1b.x, yv2b.x, yv3b.x), float4(yv0b.y, yv1b.y, yv2b.y, yv3b.y),
+            float4(yv0b.z, yv1b.z, yv2b.z, yv3b.z), float4(yv0b.w, yv1b.w, yv2b.w, yv3b.w)
+        };
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const block_stq * bx = ax[row] + ib;
+            const ushort qlo = *(device const ushort *)(bx->qs + 4*t8);
+            const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
+            const uint q32 = (uint)qlo | ((uint)qhi << 16);
+            const uchar s8 = bx->sign[t8];
+            const float d = bx->d;
+            float accum[NACC] = {0.f};
+            FOR_UNROLL (short j = 0; j < 8; ++j) {
+                const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
+                const uint code = (j & 1) ? (bytev >> 4) : (bytev & 0xF);
+                const uint b = (s8 >> j) & 1;
+                const float v = SWITCH_FORM ? stq_dot3_switch(code, b, ycol[j])
+                                            : stq_dot3_indexed(code, b, ycol[j]);
+                accum[j % NACC] += v;
+            }
+            float group_sum = 0.f;
+            FOR_UNROLL (short j = 0; j < NACC; ++j) {
+                group_sum += accum[j];
+            }
+            sumf[row] += d * group_sum;
+        }
+    }
+
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[(uint64_t)r1*args.ne0 + first_row + row] = tot;
+        }
+    }
+}
+
+kernel void kernel_mv_v24_dot3_indexed_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                             uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_dot3<2,16,false>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mv_v25_dot3_switch_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                            uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_dot3<2,16,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mv_v26_dot3_acc8_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                          uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_dot3<2,16,false,8>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mv_v27_dot3_acc2_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                          uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_dot3<2,16,false,2>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+
 // ---- v20: v18 y-column-hoisted structure but arithmetic codebook decode (no
 // table gather). The notes rejected arithmetic under the old mapping (58-64 vs
 // 85-94 GB/s) because Apple GPUs like small hot LUTs; re-tested here because the

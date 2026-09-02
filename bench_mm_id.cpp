@@ -32,11 +32,12 @@ int main(int argc, char ** argv) {
     const int n_used = argc > 7 ? atoi(argv[7]) : 1;
     const int route_pattern = argc > 8 ? atoi(argv[8]) : 0; // 0 uniform, 1 clustered, 2 spread
     const int route_seed = argc > 9 ? atoi(argv[9]) : 44;
+    const bool dense_experts = argc > 10 ? atoi(argv[10]) != 0 : false;
 
     if (k <= 0 || k % 256 != 0 || m <= 0 || tokens <= 0 ||
         nops <= 0 || nops > 256 || reps <= 0 || n_mats <= 0 ||
         n_used <= 0 || n_used > n_mats || route_pattern < 0 || route_pattern > 2) {
-        fprintf(stderr, "usage: %s [k-multiple-of-256] [m] [tokens] [ops-1..256] [repetitions] [logical-experts] [used-experts] [route-pattern: 0=uniform,1=clustered,2=spread] [route-seed]\n", argv[0]);
+        fprintf(stderr, "usage: %s [k-multiple-of-256] [m] [tokens] [ops-1..256] [repetitions] [logical-experts] [used-experts] [route-pattern: 0=uniform,1=clustered,2=spread] [route-seed] [dense-experts: 0=alias-one,1=store-all]\n", argv[0]);
         return 2;
     }
 
@@ -46,10 +47,11 @@ int main(int argc, char ** argv) {
     std::uniform_real_distribution<float> scale_dist(0.25f, 0.75f);
 
     const size_t row_blocks = ggml_row_size(GGML_TYPE_STQ1_0, k)/sizeof(block_stq1_0);
-    // Allocate one expert and alias it across the logical expert dimension.
-    // This exercises map/dispatch/empty-expert behavior without allocating the
-    // full expert stack. Every logical expert intentionally has identical data.
-    std::vector<block_stq1_0> wq((size_t)m*row_blocks);
+    // Alias one expert for very small route/dispatch tests, or store all logical
+    // experts for cache-realistic routed decode. Hy4's eight active experts use
+    // only about 17 MB at the exact 6144x2048 STQ1_0 shape.
+    const int stored_experts = dense_experts ? n_mats : 1;
+    std::vector<block_stq1_0> wq((size_t)stored_experts*m*row_blocks);
     for (auto & block : wq) {
         for (auto & q : block.qs) q = (uint8_t)byte_dist(rng);
         for (auto & s : block.sign) s = (uint8_t)byte_dist(rng);
@@ -89,12 +91,18 @@ int main(int argc, char ** argv) {
 
     struct ggml_init_params ip = { 16ull*1024*1024, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * A_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_STQ1_0, k, m);
-    ggml_tensor * A = ggml_view_3d(ctx, A_storage, k, m, 1, A_storage->nb[1], 0, 0);
-    // ggml_view_3d validates a dense span even when nb[2] is zero. Create the
-    // valid one-expert alias first, then expose the logical expert count; the
-    // backing span remains one expert because every z slice has zero stride.
-    A->ne[2] = n_mats;
+    ggml_tensor * A_storage;
+    ggml_tensor * A;
+    if (dense_experts) {
+        A_storage = ggml_new_tensor_3d(ctx, GGML_TYPE_STQ1_0, k, m, n_mats);
+        A = A_storage;
+    } else {
+        A_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_STQ1_0, k, m);
+        A = ggml_view_3d(ctx, A_storage, k, m, 1, A_storage->nb[1], 0, 0);
+        // ggml_view_3d validates a dense span even when nb[2] is zero. Create
+        // the valid one-expert alias first, then expose the logical expert count.
+        A->ne[2] = n_mats;
+    }
     ggml_tensor * I = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, tokens);
     ggml_tensor * X = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, tokens);
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -123,7 +131,9 @@ int main(int argc, char ** argv) {
         for (int u = 0; u < check_used; ++u) {
             for (int row = 0; row < check_rows; ++row) {
                 double ref = 0.0;
-                const block_stq1_0 * blocks = wq.data() + (size_t)row*row_blocks;
+                const int expert = ids[(size_t)t*n_used + u];
+                const int stored_expert = dense_experts ? expert : 0;
+                const block_stq1_0 * blocks = wq.data() + ((size_t)stored_expert*m + row)*row_blocks;
                 const float * xv = x.data() + ((size_t)t*n_used + u)*k;
                 for (size_t ib = 0; ib < row_blocks; ++ib) {
                     const block_stq1_0 & block = blocks[ib];
@@ -162,11 +172,13 @@ int main(int argc, char ** argv) {
         total += dt;
     }
 
-    const double bytes = (double)nops*ggml_nbytes(A_storage);
+    const double one_expert_bytes = (double)m*ggml_row_size(GGML_TYPE_STQ1_0, k);
+    const double logical_work_bytes = (double)nops*n_used*tokens*one_expert_bytes;
     const char * route_name = route_pattern == 0 ? "uniform" : route_pattern == 1 ? "clustered" : "spread";
-    printf("STQ1_0 mul_mat_id %dx%d tokens=%d experts=%d used=%d routes=%s seed=%d x %d ops: max_abs %.4g; best %.4f ms -> %6.1f GB/s (one-expert-equivalent; mean %.4f ms -> %6.1f GB/s)\n",
-           m, k, tokens, n_mats, n_used, route_name, route_seed, nops, max_abs, best*1e3, bytes/best/1e9,
-           total/reps*1e3, bytes/(total/reps)/1e9);
+    printf("STQ1_0 mul_mat_id %dx%d tokens=%d experts=%d used=%d storage=%s routes=%s seed=%d x %d ops: max_abs %.4g; best %.4f ms -> %6.1f logical GB/s (mean %.4f ms -> %6.1f logical GB/s)\n",
+           m, k, tokens, n_mats, n_used, dense_experts ? "dense" : "alias-one", route_name, route_seed,
+           nops, max_abs, best*1e3, logical_work_bytes/best/1e9,
+           total/reps*1e3, logical_work_bytes/(total/reps)/1e9);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
