@@ -19,5 +19,7 @@ test_stq1_0_metal
 # private session notes — never publish (local paths, infra, fleet refs)
 SESSION-NOTES.md
 
-# benchmark output: llama-bench echoes absolute model paths into logs
-results/
+# Benchmark raw output can contain absolute model paths; publish only reviewed
+# Markdown summaries that deliberately omit prompts and private paths.
+results/*
+!results/*.md

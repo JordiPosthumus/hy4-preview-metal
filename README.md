@@ -30,8 +30,8 @@ Plus the host-side pipeline plumbing (`ggml-metal-device.cpp`, `ggml-metal-ops.c
 
 ## Results (M3 Ultra)
 
-> Kernel bandwidth below is measured on this machine. End-to-end token throughput is a marked
-> estimate, not a measurement.
+> Kernel bandwidth below comes from bounded standalone measurements. Full-model
+> throughput is measured from completed live server turns and is labelled separately.
 
 Decode-path matvec bandwidth (16384×16384, standalone A/B bench):
 
@@ -87,13 +87,24 @@ Correctness: all three batch paths match a float64 reference to float rounding
 (max abs err 0.0000–0.023 on unit-scale dots; the CPU int8 path is less accurate
 at 0.63–0.91).
 
-End-to-end on a 512 GB M3 Ultra: the full 229 GB model loads in roughly 1–2 minutes
-(observed 47 s warm, ~100 s cold page-cache) with ~212 GB RSS, and serves completions
-through the OpenAI API. Measured token throughput is **~9–10 tok/s decode in use** — about 2.1× the 6 tok/s the
-original kernel mapping would have managed. (About 23 GB of weights are read per token; the
-ternary experts are only ~5 GB of that, the rest being shared expert / attention / F32 lm_head
-on llama.cpp's mature kernels.) A formal `llama-bench` sweep is on the list to pin the exact
-figure; it won't move far.
+End-to-end on a 512 GB M3 Ultra: the full 229 GB model loaded in **80.77 s**
+for the latest observed run (earlier warm-cache run: 47.40 s), occupied **214.1 GB
+RSS**, and served completions through the OpenAI API. A completed 10,808-token
+live prompt measured **70.89 prompt tok/s** followed by 159 decoded tokens at
+**5.27 tok/s**. An earlier nearly identical-length 10,801-token turn on the initial
+Metal implementation measured 66.55 prompt tok/s and 4.80 decode tok/s, making
+the observational deltas +6.5% and +9.8%. These are not controlled A/B results:
+output length, cache state, thermals, and machine contention differed.
+
+The much smaller end-to-end gain than the standalone expert-matvec gain is
+important: STQ1_0 expert decoding is only one part of each token. Shared-expert,
+attention/DSA, and F32 output-head work now dominate the remaining time. A
+following prefix-cache-reuse turn evaluated 1,455 new prompt tokens at 50.07
+tok/s and decoded 89 tokens at 5.03 tok/s at the longer context. The complete
+configuration, raw timing lines, cache behavior, contention caveats, and a rough
+Amdahl analysis are in the [live-server record](results/live-server-2026-09-01.md).
+A controlled `llama-bench` sweep remains useful, but must not be run alongside the
+resident server because it would load a second copy of the 229 GB model.
 
 ## Reproduce
 
