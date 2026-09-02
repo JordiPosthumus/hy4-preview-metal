@@ -521,11 +521,10 @@ kernel void kernel_mv_v18_hoist8x4(constant mvargs & args, device const char * s
     mv_impl_v18<8,4>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 
-// ---- v19: v18 + all 8 y-columns hoisted but 4-way accumulator (full ILP) and
-// the char4 codebook gathered once into float4 registers before the row loop.
-// Decode cost is shared across NR0 rows since weights differ but the y-columns
-// are the same; gather the codebook into float4 once per (row) here anyway.
-template<int NR0, int NSG>
+// ---- v19: v18 + all 8 y-columns hoisted and a 4-way accumulator (full ILP).
+// The y-columns are shared across NR0 rows; weight codes and their char4 table
+// gathers remain row-specific.
+template<int NR0, int NSG, bool BCAST_SCALE = false, bool SPARSE_FMA = false, bool EXACT_K6144 = false>
 void mv_impl_v19(constant mvargs & args,
                  device const char * src0,
                  device const float * y,
@@ -547,7 +546,8 @@ void mv_impl_v19(constant mvargs & args,
     const int chunk = t8 >> 1;
     const int gbase = (t8 & 1) << 3;
 
-    for (int ib = ix; ib < nb; ib += 4) {
+    const int loop_nb = EXACT_K6144 ? 24 : nb;
+    for (int ib = ix; ib < loop_nb; ib += 4) {
         device const float * yb = y + r1*args.ne00 + ib*256 + chunk*64 + gbase;
         const float4 yv0a = *(device const float4 *)(yb);
         const float4 yv0b = *(device const float4 *)(yb + 4);
@@ -570,7 +570,9 @@ void mv_impl_v19(constant mvargs & args,
             const ushort qhi = *(device const ushort *)(bx->qs + 4*t8 + 2);
             const uint  q32 = (uint)qlo | ((uint)qhi << 16);
             const uchar s8  = bx->sign[t8];
-            const float d = bx->d;
+            const float d = BCAST_SCALE
+                ? simd_shuffle(t8 == 0 ? (float)bx->d : 0.f, ix*8)
+                : (float)bx->d;
             float a0=0.f,a1=0.f,a2=0.f,a3=0.f;
             FOR_UNROLL (short j = 0; j < 8; j++) {
                 const uint bytev = (q32 >> (8*(j >> 1))) & 0xFF;
@@ -578,7 +580,15 @@ void mv_impl_v19(constant mvargs & args,
                 const uint b     = (s8 >> j) & 1;
                 const float4 lv  = float4(stq_cb4_full[(b << 4) | code]);
                 const float4 yj  = ycol[j];
-                a0 += lv.x*yj.x; a1 += lv.y*yj.y; a2 += lv.z*yj.z; a3 += lv.w*yj.w;
+                if (SPARSE_FMA) {
+                    const uint zero_lane = code >> 2;
+                    if (zero_lane != 0) a0 += lv.x*yj.x;
+                    if (zero_lane != 1) a1 += lv.y*yj.y;
+                    if (zero_lane != 2) a2 += lv.z*yj.z;
+                    if (zero_lane != 3) a3 += lv.w*yj.w;
+                } else {
+                    a0 += lv.x*yj.x; a1 += lv.y*yj.y; a2 += lv.z*yj.z; a3 += lv.w*yj.w;
+                }
             }
             sumf[row] += d * ((a0+a1)+(a2+a3));
         }
@@ -598,6 +608,18 @@ kernel void kernel_mv_v19_4acc_2x16(constant mvargs & args, device const char * 
 kernel void kernel_mv_v19_4acc_2x8(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
                                    uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     mv_impl_v19<2,8>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v21_scale_bcast_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                           uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v19<2,16,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v22_sparse_fma_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                          uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v19<2,16,false,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
+}
+kernel void kernel_mv_v23_exact_k6144_2x16(constant mvargs & args, device const char * src0, device const float * y, device float * dst,
+                                           uint3 tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mv_impl_v19<2,16,false,false,true>(args, src0, y, dst, tgpig, tiisg, sgitg);
 }
 
 // ---- v20: v18 y-column-hoisted structure but arithmetic codebook decode (no

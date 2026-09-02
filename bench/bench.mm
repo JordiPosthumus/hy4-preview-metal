@@ -161,11 +161,14 @@ int main(int argc, char ** argv) {
                                     "kernel_mv_v11_shy_2x4", "kernel_mv_v11_shy_4x8",
                                     "kernel_mv_v18_hoist2x16", "kernel_mv_v18_hoist4x16", "kernel_mv_v18_hoist4x8", "kernel_mv_v18_hoist8x8", "kernel_mv_v18_hoist8x4",
                                     "kernel_mv_v19_4acc_2x16", "kernel_mv_v19_4acc_2x8",
-                                    "kernel_mv_v20_arith_2x16" };
-        const int nsgs[] = { 2, 4, 4, 2, 2, 4, 4, 8, 8, 8, 4, 8, 8, 16, 16, 16, 16, 16, 16, 8, 4, 8, 16, 16, 8, 4, 8, 4, 16, 16, 8, 16 };
-        const int nr0s[] = { 8, 4, 4, 4, 8, 4, 8, 2, 4, 4, 8, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 2, 2, 2, 4, 8, 8, 2, 2, 2, 2 };
-        const int tmemf[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+                                    "kernel_mv_v20_arith_2x16", "kernel_mv_v21_scale_bcast_2x16", "kernel_mv_v22_sparse_fma_2x16", "kernel_mv_v23_exact_k6144_2x16" };
+        const int nsgs[] = { 2, 4, 4, 2, 2, 4, 4, 8, 8, 8, 4, 8, 8, 16, 16, 16, 16, 16, 16, 8, 4, 8, 16, 16, 8, 8, 4, 16, 8, 16, 16, 16, 16 };
+        const int nr0s[] = { 8, 4, 4, 4, 8, 4, 8, 2, 4, 4, 8, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 4, 2, 4, 4, 8, 8, 2, 2, 2, 2, 2, 2 };
+        const int tmemf[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         const int n_variants = sizeof(variants)/sizeof(variants[0]);
+        static_assert(sizeof(nsgs)/sizeof(nsgs[0]) == n_variants);
+        static_assert(sizeof(nr0s)/sizeof(nr0s[0]) == n_variants);
+        static_assert(sizeof(tmemf)/sizeof(tmemf[0]) == n_variants);
 
         id<MTLCommandQueue> q = [dev newCommandQueue];
         id<MTLComputePipelineState> thrash_ps = nil;
