@@ -30,11 +30,13 @@ int main(int argc, char ** argv) {
     const int reps   = argc > 5 ? atoi(argv[5]) : 10;
     const int n_mats = argc > 6 ? atoi(argv[6]) : 1;
     const int n_used = argc > 7 ? atoi(argv[7]) : 1;
+    const int route_pattern = argc > 8 ? atoi(argv[8]) : 0; // 0 uniform, 1 clustered, 2 spread
+    const int route_seed = argc > 9 ? atoi(argv[9]) : 44;
 
     if (k <= 0 || k % 256 != 0 || m <= 0 || tokens <= 0 ||
         nops <= 0 || nops > 256 || reps <= 0 || n_mats <= 0 ||
-        n_used <= 0 || n_used > n_mats) {
-        fprintf(stderr, "usage: %s [k-multiple-of-256] [m] [tokens] [ops-1..256] [repetitions] [logical-experts] [used-experts]\n", argv[0]);
+        n_used <= 0 || n_used > n_mats || route_pattern < 0 || route_pattern > 2) {
+        fprintf(stderr, "usage: %s [k-multiple-of-256] [m] [tokens] [ops-1..256] [repetitions] [logical-experts] [used-experts] [route-pattern: 0=uniform,1=clustered,2=spread] [route-seed]\n", argv[0]);
         return 2;
     }
 
@@ -57,9 +59,28 @@ int main(int argc, char ** argv) {
     std::vector<float> x((size_t)k*n_used*tokens);
     for (auto & v : x) v = fdist(rng);
     std::vector<int32_t> ids((size_t)n_used*tokens);
+    std::mt19937 route_rng(route_seed);
+    std::uniform_int_distribution<int> expert_dist(0, n_mats - 1);
     for (int t = 0; t < tokens; ++t) {
         for (int u = 0; u < n_used; ++u) {
-            ids[(size_t)t*n_used + u] = (t*n_used + u) % n_mats;
+            if (route_pattern == 1) {
+                ids[(size_t)t*n_used + u] = u % n_mats;
+                continue;
+            }
+            if (route_pattern == 2) {
+                ids[(size_t)t*n_used + u] = (t*n_used + u) % n_mats;
+                continue;
+            }
+            int expert;
+            bool duplicate;
+            do {
+                expert = expert_dist(route_rng);
+                duplicate = false;
+                for (int prior = 0; prior < u; ++prior) {
+                    duplicate |= ids[(size_t)t*n_used + prior] == expert;
+                }
+            } while (duplicate);
+            ids[(size_t)t*n_used + u] = expert;
         }
     }
 
@@ -142,8 +163,9 @@ int main(int argc, char ** argv) {
     }
 
     const double bytes = (double)nops*ggml_nbytes(A_storage);
-    printf("STQ1_0 mul_mat_id %dx%d tokens=%d experts=%d used=%d x %d ops: max_abs %.4g; best %.4f ms -> %6.1f GB/s (one-expert-equivalent; mean %.4f ms -> %6.1f GB/s)\n",
-           m, k, tokens, n_mats, n_used, nops, max_abs, best*1e3, bytes/best/1e9,
+    const char * route_name = route_pattern == 0 ? "uniform" : route_pattern == 1 ? "clustered" : "spread";
+    printf("STQ1_0 mul_mat_id %dx%d tokens=%d experts=%d used=%d routes=%s seed=%d x %d ops: max_abs %.4g; best %.4f ms -> %6.1f GB/s (one-expert-equivalent; mean %.4f ms -> %6.1f GB/s)\n",
+           m, k, tokens, n_mats, n_used, route_name, route_seed, nops, max_abs, best*1e3, bytes/best/1e9,
            total/reps*1e3, bytes/(total/reps)/1e9);
 
     ggml_backend_buffer_free(buf);
