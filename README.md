@@ -19,7 +19,7 @@ full Metal support:
 
 | kernel | purpose |
 |---|---|
-| `kernel_mul_mv_stq1_0_f32` | decode (batch 1) — four blocks per SIMD group, vector-valued ternary lookup, group-aligned float4 loads |
+| `kernel_mul_mv_stq1_0_f32` | decode (batch 1) — four blocks per SIMD group, direct exact-3:4 dot, group-aligned float4 loads |
 | `kernel_mul_mv_ext_stq1_0_f32_r1_2..5` | small batches (2–8) |
 | `kernel_mul_mm_stq1_0_f32/_f16` | prefill (batch ≥ 9) |
 | `kernel_mul_mm_id_stq1_0_f32/_f16` | MoE routed-expert matmuls (`mul_mat_id`) |
@@ -66,6 +66,17 @@ withdrawn. With every variant name statically matched to its real NR0/NSG geomet
 the component-wise kernel still wins: at 6144x2048 its paired GPU-time median is
 **4.4% lower** than the prior hoisted-dot kernel (AB 2.2%, BA 8.1%; 15/20 wins),
 with max absolute errors of 1.69e-5 and 1.84e-5 respectively.
+
+A fourth decode pass uses STQ1_0's exact 3:4 structure directly. The code's high
+bits identify the zero lane, its low bits identify two sign flips, and the separate
+sign bit negates the group. Computing that three-term signed dot avoids constructing
+a decoded `float4` and multiplying the known zero lane. In a cache-realistic routed
+wrapper with eight distinct 6144x2048 expert matrices (about 17 MB of compressed
+weights), six balanced ABBA runs cut median best graph time from **2.150 ms to
+1.664 ms (22.6%)**; every candidate run beat every baseline run. The median of run
+means improved 15.6%, and maximum absolute error stayed below 9e-6. This is an
+isolated STQ1_0 routed-kernel result, not a token-throughput claim; the full model
+was not loaded or mapped.
 
 Small-batch scheduling is now specialized only for Hy4's exact 6144x2048 STQ1_0
 experts. Batches 4, 5, 7, and 8 use one SIMD group and a four-lane row reduction;
@@ -146,9 +157,14 @@ build-metal/bin/llama-server -m Hy4-preview-STQ1_0.gguf -a Hy4-preview-STQ1_0 \
   `g = (w/64)*16 + (w%16)` at lane `p = (w%64)/16`. The 32-entry codebook's sign=1
   half is exactly the negation of the sign=0 half (`q' = 0xAA - q` per byte), but an
   arithmetic decode is *slower* than the constant-cache gather on Apple GPU.
+- **Exploit sparsity at the dot, not by reconstructing weights**: each STQ1_0 code
+  has exactly one zero and three signed unit lanes. A direct signed three-term dot
+  is faster than the `char4 -> float4 -> dot` path at cache-realistic expert
+  working sets. A switch-based form and two/eight accumulator variants did not
+  survive balanced production-wrapper testing and are not shipped.
 - **Threadgroup shape depends on matrix dimensions**: at 16384×16384,
   NR0=4/NSG=4 beat 8×2 and 16×1 by ~30%; at Hy4's 6144×2048 expert shape,
-  NR0=2/NSG=16 with the vector codebook and four-block SIMD mapping wins instead
+  NR0=2/NSG=16 with the direct 3:4 dot and four-block SIMD mapping wins instead
   (see Results).
 - **Test-data hygiene**: random bytes reinterpreted as fp16 are ~3% inf/nan — use
   finite scales when building synthetic validation data, or your error metric lies.

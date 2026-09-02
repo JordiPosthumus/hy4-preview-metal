@@ -1,6 +1,6 @@
 # Hy4-preview STQ1_0 on M3 Ultra — work log
 
-## Status: READY TO LOAD (weights downloaded+verified, runtime built+validated, model NOT loaded yet)
+## Status: runtime built and validated; server currently stopped
 
 ## What's here
 - `llama.cpp/` — pinned @ 0cea36222 + AngelSlim hyv4/STQ1_0 patches + custom Metal kernels
@@ -179,6 +179,60 @@ mul_mv_ext admission in ggml-metal-ops.cpp.
   separate order-split ratios. Sign-flipping or load-dependent results do not ship.
 - All work used bounded exact-shape synthetic allocations; the full model was not
   opened, mapped, or loaded.
+
+## Exact-3:4 direct-dot decode (2026-09-02 autoresearch)
+- Replaced batch-1 STQ1_0's `char4 -> float4 -> component multiplies` sequence
+  with a direct dot over the three nonzero lanes. The code's high two bits select
+  the zero lane, its low bits select two lane sign flips, and the separate sign
+  bit negates the whole group. The accepted kernel retains four independent
+  accumulator chains and the existing NR0=2/NSG=16 launch geometry.
+- A dense routed harness now optionally stores all logical experts instead of
+  aliasing one matrix. Eight distinct exact-shape 6144x2048 STQ1_0 matrices use
+  about 17 MB, exercise cache-realistic expert turnover, and still avoid the
+  229 GB model. Correctness indexes each routed expert's own weights.
+- Six balanced ABBA runs against the prior library measured median best graph
+  time of 2.1496 ms baseline versus 1.6640 ms candidate, a **22.6% reduction**;
+  all six candidate runs beat all six baseline runs. Median run means fell from
+  2.4322 to 2.0524 ms (15.6%). Maximum absolute errors were 8.223e-06 baseline
+  and 8.792e-06 candidate.
+- Standalone streaming probes agreed at larger working sets: the direct form cut
+  median GPU time about 11.5% at 16384x16384 and 9.4% at 6144x16384. The tiny
+  2.1 MB single-expert cold-cache result was slower, which is why acceptance was
+  based on the eight-expert production wrapper rather than that microbenchmark.
+- Final CPU-vs-Metal validation remains 0.0000/0.0001/0.0232 maximum absolute
+  error at BS1/BS8/BS32. The model was not opened, mapped, or loaded.
+- A final dense eight-expert run used 77,955,072 bytes maximum RSS and a
+  392,315,600-byte OS peak footprint. It incurred zero swaps and read no model
+  data; the intentionally small allocation is the complete benchmark working set.
+- Rejected and not shipped: a switch-based zero-lane form; eight accumulators,
+  whose result changed sign with order; and two accumulators, which won the
+  standalone shader microbenchmark but lost about 2% in the production wrapper.
+  Four chains remain in production.
+
+## Upstream research check (2026-09-02)
+- Local Firecrawl was unavailable (`127.0.0.1:3002` refused the health check),
+  so it was deliberately not started while the Mac was in use. The fallback used
+  direct GitHub source, PR, and issue pages.
+- [MLX PR 3120](https://github.com/ml-explore/mlx/pull/3120) adds split-K
+  quantized matmul for small M and reports substantial M3 Max wins around M=12-32,
+  but its temporary partial-output buffer and reduction target a different regime.
+  [MLX issue 3553](https://github.com/ml-explore/mlx/issues/3553) reports regressions
+  when that route is forced around M=3-8, Hy4's current specialized small batches.
+  Keep split-K as a prefill/concurrency experiment, not a decode change.
+- [MLX issue 3251](https://github.com/ml-explore/mlx/issues/3251) describes
+  cooperative scale caching for small quantization groups. STQ1_0 has one scale
+  per 256 weights, and this repo's measured scale-broadcast probe was about 6.2%
+  slower, so the idea was not transplanted.
+- [MLX issue 3852](https://github.com/ml-explore/mlx/issues/3852) reinforces the
+  importance of dual-issue-friendly reductions for low-bit small-M kernels. That
+  motivated the accumulator-count sweep; only the existing four-chain form passed
+  the production-wrapper gate.
+- Current llama.cpp Hy4 work remains architecture/quant plumbing rather than a
+  competing Apple kernel: [PR 28127](https://github.com/ggml-org/llama.cpp/pull/28127)
+  has no Metal STQ1_0 implementation, while [PR 28067](https://github.com/ggml-org/llama.cpp/pull/28067)
+  explicitly excludes STQ1_0 from Metal for lack of a kernel. The separate
+  [STQ NEON PR 22836](https://github.com/ggml-org/llama.cpp/pull/22836) is CPU-only.
+  No better public STQ1_0 Metal kernel was found in this pass.
 
 ## Estimated real-model decode
 Active ~23GB/token (experts ~5GB at STQ/IQ2 + shared expert ~14GB + attn + F32 lm_head).
